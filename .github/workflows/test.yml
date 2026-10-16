@@ -1,0 +1,11 @@
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n install.sh && shellcheck install.sh
+      - run: python3 -m unittest discover -s tests -v
