@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # 固定管理器版本，避免一次安装混入不同版本的文件。
-VERSION=v0.2.0
+VERSION=v0.3.0
 if [[ ${EUID} -ne 0 ]]; then
     echo '请用 root 执行，或先运行 sudo -i。' >&2
     exit 1
@@ -17,7 +17,7 @@ if ! command -v apt-get >/dev/null; then
 fi
 
 missing=()
-for pair in 'curl:curl' 'python3:python3' 'openssl:openssl' 'ss:iproute2' 'useradd:passwd'; do
+for pair in 'curl:curl' 'python3:python3' 'openssl:openssl' 'ss:iproute2' 'useradd:passwd' 'nft:nftables'; do
     command -v "${pair%%:*}" >/dev/null || missing+=("${pair#*:}")
 done
 [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing+=(ca-certificates)

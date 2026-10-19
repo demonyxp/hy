@@ -3,6 +3,8 @@
 
 import argparse
 import base64
+from contextlib import contextmanager
+from decimal import Decimal, InvalidOperation
 import datetime as dt
 import getpass
 import hashlib
@@ -22,7 +24,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 REPO = "HyNetworks/hysteria"
 ETC = Path("/etc/hy")
 LIB = Path("/usr/local/lib/hy")
@@ -33,6 +35,8 @@ BIN = LIB / "hysteria"
 SERVICE = "hy-server.service"
 USER = "hyproxy"
 MARKER = "demonyxp/hy"
+TRAFFIC_TABLE = "hy_traffic"
+TRAFFIC_SERVICE = "hy-traffic.service"
 
 
 def run(args, **kwargs):
@@ -408,6 +412,19 @@ OnUnitActiveSec=1h
 Persistent=true
 [Install]
 WantedBy=timers.target
+""", TRAFFIC_SERVICE: f"""# {MARKER}
+[Unit]
+Description=HY client IP traffic counters and rate limits
+After=network-pre.target nftables.service ufw.service
+Before={SERVICE}
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/hy traffic-apply
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
 """}
 
 
@@ -505,9 +522,13 @@ def configure():
     was_active = service_active()
     try:
         write_config(new)
+        if old.get("traffic", {}).get("enabled"):
+            apply_traffic(new)
         restart_checked()
     except Exception:
         restore_config(saved)
+        if old.get("traffic", {}).get("enabled"):
+            apply_traffic(old)
         if was_active:
             restart_checked()
         else:
@@ -627,6 +648,213 @@ def unpublish():
     print("已撤销订阅发布；已经导入的节点仍可连接，撤销节点访问请修改密码。")
 
 
+def rate_mbps(value):
+    try:
+        if not re.fullmatch(r"[0-9]{1,5}(?:\.[0-9]{1,3})?", str(value)):
+            raise ValueError()
+        rate = Decimal(str(value))
+        if rate < 0 or rate > 10000:
+            raise ValueError()
+        return format(rate.normalize(), "f") if rate else "0"
+    except (ValueError, InvalidOperation) as exc:
+        raise ValueError("速率请输入 0～10000 Mbps，最多 3 位小数；0 表示不限速。") from exc
+
+
+def nft_table():
+    if not shutil.which("nft"):
+        raise ValueError("需要 nftables，请先执行 apt-get update && apt-get install -y nftables，或更新安装器。")
+    tables = json.loads(output(["nft", "-j", "list", "tables"]))["nftables"]
+    if not any(item.get("table", {}).get("name") == TRAFFIC_TABLE and
+               item["table"].get("family") == "inet" for item in tables):
+        return None
+    table = json.loads(output(["nft", "-j", "list", "table", "inet", TRAFFIC_TABLE]))
+    if not any(item.get("table", {}).get("comment") == MARKER for item in table["nftables"]):
+        raise ValueError("同名 nftables 表不属于本工具，拒绝操作。")
+    return table
+
+
+def traffic_rules(state, exists):
+    port = port_number(state["port"])
+    table = f"inet {TRAFFIC_TABLE}"
+    rules = []
+    if not exists:
+        rules.append(f'add table {table} {{ comment "{MARKER}"; }}')
+        for direction in ("up", "down"):
+            for version in (4, 6):
+                rules.append(f"add set {table} {direction}{version} {{ type ipv{version}_addr; "
+                             "flags dynamic,timeout; timeout 24h; size 65536; }")
+        for chain, hook in (("incoming", "input"), ("outgoing", "output")):
+            rules.append(f"add chain {table} {chain} {{ type filter hook {hook} priority 10; policy accept; }}")
+        for chain in ("upload_limits", "download_limits"):
+            rules.append(f"add chain {table} {chain}")
+    else:
+        # 只刷新自己的规则链，保留计数集合，不清空系统防火墙。
+        for chain in ("incoming", "outgoing", "upload_limits", "download_limits"):
+            rules.append(f"flush chain {table} {chain}")
+    for direction, chain, field, address_field in (("upload", "incoming", "dport", "saddr"),
+                                                   ("download", "outgoing", "sport", "daddr")):
+        rules.append(f"add rule {table} {chain} udp {field} {port} jump {direction}_limits")
+        for version in (4, 6):
+            protocol = "ip" if version == 4 else "ip6"
+            counter = ("up" if direction == "upload" else "down") + str(version)
+            rules.append(f"add rule {table} {chain} udp {field} {port} update @{counter} {{ {protocol} {address_field} counter }}")
+        for address, limit in sorted(state.get("traffic", {}).get("limits", {}).items()):
+            address = ip_literal(address)
+            rate = Decimal(rate_mbps(limit.get(direction, "0")))
+            if not rate:
+                continue
+            byte_rate = int(rate * 125000)
+            protocol = "ip6" if ":" in address else "ip"
+            burst = max(1500, min(byte_rate // 10, 1048576))
+            rules.append(f"add rule {table} {direction}_limits {protocol} {address_field} {address} "
+                         f"limit rate over {byte_rate} bytes/second burst {burst} bytes counter drop "
+                         f'comment "{direction} {address}"')
+    return "\n".join(rules) + "\n"
+
+
+def apply_traffic(state):
+    existing = nft_table()
+    if not state.get("traffic", {}).get("enabled"):
+        if existing:
+            run(["nft", "delete", "table", "inet", TRAFFIC_TABLE])
+        return
+    script = traffic_rules(state, bool(existing))
+    # 先验证再原子提交整批规则；语法或内核能力不足时不会留下半套限速规则。
+    run(["nft", "--check", "-f", "-"], input=script, text=True)
+    run(["nft", "-f", "-"], input=script, text=True)
+
+
+def save_traffic(state, config):
+    unit = UNIT_DIR / TRAFFIC_SERVICE
+    if unit.exists() and MARKER not in unit.read_text():
+        raise ValueError("同名监控服务不属于本工具，拒绝覆盖。")
+    nft_table()
+    new = {**state, "traffic": config}
+    try:
+        apply_traffic(new)
+        atomic_write(STATE, json_text(new))
+        atomic_write(unit, units()[TRAFFIC_SERVICE], 0o644)
+        run(["systemctl", "daemon-reload"])
+        run(["systemctl", "enable", TRAFFIC_SERVICE] if config["enabled"] else
+            ["systemctl", "disable", "--now", TRAFFIC_SERVICE])
+    except Exception:
+        apply_traffic(state)
+        atomic_write(STATE, json_text(state))
+        raise
+    return new
+
+
+def ensure_monitor():
+    state = load_state()
+    if not state.get("traffic", {}).get("enabled") or nft_table() is None:
+        state = save_traffic(state, {**state.get("traffic", {}), "enabled": True})
+        print("已启用 HY2 客户端 IP 监控；配置会在开机时恢复。")
+    return state
+
+
+def traffic_snapshot(table):
+    result = {}
+    for item in (table or {}).get("nftables", []):
+        collection = item.get("set", {})
+        name = collection.get("name", "")
+        if name not in ("up4", "up6", "down4", "down6"):
+            continue
+        direction = "upload" if name.startswith("up") else "download"
+        for entry in collection.get("elem", []):
+            element = entry.get("elem", {})
+            address = element.get("val")
+            if isinstance(address, str):
+                result.setdefault(address, {"upload": 0, "download": 0})[direction] = element.get("counter", {}).get("bytes", 0)
+    return result
+
+
+def monitor(once=False, interval=2):
+    print("只统计 HY2 UDP 端口放行的流量（含协议开销），方向以客户端为准。")
+    print("累计值自启用/计数重建起；IP 单方向空闲 24 小时后清零。Ctrl+C 退出显示，监控与限速继续。")
+    previous = traffic_snapshot(nft_table())
+    last = time.monotonic()
+    while True:
+        time.sleep(interval)
+        table = nft_table()
+        if table is None:
+            raise ValueError("监控规则已被移除；需要时重新运行 hy monitor。")
+        now = time.monotonic()
+        current = traffic_snapshot(table)
+        limits = load_state().get("traffic", {}).get("limits", {})
+        if sys.stdout.isatty() and not once:
+            print("\033[2J\033[H", end="")
+        print(f"\nHY2 客户端 IP 流量 {dt.datetime.now():%H:%M:%S}（Mbps；累计 MiB；↑上传 ↓下载）")
+        print(f"{'客户端 IP':<40} {'↑ Mbps':>10} {'↓ Mbps':>10} {'↑ MiB':>10} {'↓ MiB':>10}  限速↑/↓ Mbps")
+        for address, values in sorted(current.items(), key=lambda item: sum(item[1].values()), reverse=True):
+            before = previous.get(address, {"upload": 0, "download": 0})
+            rates = [max(0, values[d] - before[d]) * 8 / (now - last) / 1000000 for d in ("upload", "download")]
+            limit = limits.get(address, {})
+            label = "/".join(str(limit.get(d, "0")) if Decimal(str(limit.get(d, "0"))) else "不限" for d in ("upload", "download"))
+            print(f"{address:<40} {rates[0]:10.3f} {rates[1]:10.3f} {values['upload']/1048576:10.2f} {values['download']/1048576:10.2f}  {label}")
+        if not current:
+            print("暂无流量，请连接节点并访问网站。")
+        if once:
+            return
+        previous, last = current, now
+
+
+def set_limit(address=None, upload=None, download=None):
+    state = load_state()
+    address = ip_literal(address) if address else ask_valid("客户端公网 IP", ip_literal)
+    config = {**state.get("traffic", {}), "enabled": True,
+              "limits": dict(state.get("traffic", {}).get("limits", {}))}
+    old = config["limits"].get(address, {"upload": "0", "download": "0"})
+    if upload is None and download is None:
+        upload = ask_valid("客户端上传上限 Mbps（0 不限）", rate_mbps, old["upload"])
+        download = ask_valid("客户端下载上限 Mbps（0 不限）", rate_mbps, old["download"])
+    new = {"upload": rate_mbps(upload if upload is not None else old["upload"]),
+           "download": rate_mbps(download if download is not None else old["download"])}
+    if new == {"upload": "0", "download": "0"}:
+        config["limits"].pop(address, None)
+    else:
+        config["limits"][address] = new
+    save_traffic(state, config)
+    print(f"已保存 {address}：上传 {new['upload']} Mbps，下载 {new['download']} Mbps（0 不限）。")
+    print("限速采用内核令牌桶丢弃超额包，允许短时突发，实际应用速度可能低于上限。")
+
+
+def remove_limit(address=None):
+    state = load_state()
+    address = ip_literal(address) if address else ask_valid("要取消限速的客户端公网 IP", ip_literal)
+    config = {"enabled": False, **state.get("traffic", {}),
+              "limits": dict(state.get("traffic", {}).get("limits", {}))}
+    config["limits"].pop(address, None)
+    save_traffic(state, config)
+    print(f"已取消 {address} 的限速。")
+
+
+def show_limits():
+    config = load_state().get("traffic", {})
+    active = bool(config.get("enabled") and nft_table())
+    print("监控和限速：" + ("已启用" if active else "未启用或规则已被移除"))
+    for address, limit in config.get("limits", {}).items():
+        print(f"{address}  上传 {limit['upload']} Mbps / 下载 {limit['download']} Mbps（0 不限）")
+    if not config.get("limits"):
+        print("没有配置 IP 限速。")
+
+
+def monitor_off():
+    state = load_state()
+    save_traffic(state, {**state.get("traffic", {}), "enabled": False})
+    print("已关闭监控和限速。配置保留，下次 hy monitor 会恢复；取消单个 IP 限速用 hy unlimit IP。")
+
+
+@contextmanager
+def management_lock():
+    import fcntl
+    with open("/run/lock/demonyxp-hy.lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError("另一个 hy 操作正在运行，请稍后重试。") from exc
+        yield
+
+
 def firewall_hint(state):
     print(f"\n请在云安全组和宝塔防火墙放行 UDP {state['port']}。")
     print(f"若正在使用 UFW，可执行：ufw allow {state['port']}/udp")
@@ -662,11 +890,13 @@ def doctor():
 
 
 def uninstall():
-    load_state()
+    state = load_state()
     if prompt("将停用并删除本工具的服务和配置，输入 UNINSTALL 确认") != "UNINSTALL":
         print("已取消。")
         return
     saved = backup()
+    if state.get("traffic"):
+        save_traffic(state, {**state["traffic"], "enabled": False})
     unpublish()
     run(["systemctl", "disable", "--now", "hy-cert-sync.timer", SERVICE])
     subprocess.run(["systemctl", "stop", "hy-cert-sync.service"], check=False)
@@ -686,16 +916,17 @@ def uninstall():
 
 def main():
     parser = argparse.ArgumentParser(description="HY：中文 Hysteria2 单节点管理工具")
-    parser.add_argument("command", nargs="?", default="menu", choices=["menu", "install", "configure", "update", "export", "publish", "unpublish", "sync-cert", "doctor", "logs", "start", "stop", "restart", "backup", "uninstall"])
+    parser.add_argument("command", nargs="?", default="menu", choices=["menu", "install", "configure", "update", "export", "publish", "unpublish", "sync-cert", "doctor", "logs", "start", "stop", "restart", "backup", "uninstall", "monitor", "limit", "unlimit", "limits", "monitor-off", "traffic-apply"])
+    parser.add_argument("ip", nargs="?", help="需要限速的客户端公网 IP")
+    parser.add_argument("--upload", type=rate_mbps, help="客户端上传上限 Mbps，0 不限")
+    parser.add_argument("--download", type=rate_mbps, help="客户端下载上限 Mbps，0 不限")
+    parser.add_argument("--once", action="store_true", help="监控只采样一次")
     args = parser.parse_args()
+    if (args.ip and args.command not in ("limit", "unlimit")) or (args.once and args.command != "monitor") or \
+       ((args.upload is not None or args.download is not None) and args.command != "limit"):
+        parser.error("IP 仅用于 limit/unlimit；速率仅用于 limit；--once 仅用于 monitor。")
     if platform.system() != "Linux" or os.geteuid() != 0 or not Path("/run/systemd/system").is_dir():
         raise ValueError("请在使用 systemd 的 Linux 服务器上以 root 运行。")
-    import fcntl
-    lock = open("/run/lock/demonyxp-hy.lock", "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
-        raise ValueError("另一个 hy 操作正在运行，请稍后重试。") from exc
     if not sys.stdin.isatty() and Path("/dev/tty").exists():
         try:
             sys.stdin = open("/dev/tty", encoding="utf-8")
@@ -707,14 +938,30 @@ def main():
                "logs": lambda: run(["journalctl", "-u", SERVICE, "-n", "60", "--no-pager"]),
                "start": start, "restart": restart_checked,
                "stop": lambda: run(["systemctl", "stop", SERVICE]), "backup": lambda: (load_state(), backup()),
-               "uninstall": uninstall}
+               "uninstall": uninstall, "limit": lambda: set_limit(args.ip, args.upload, args.download),
+               "unlimit": lambda: remove_limit(args.ip), "limits": show_limits,
+               "monitor-off": monitor_off, "traffic-apply": lambda: apply_traffic(load_state())}
+    def dispatch(command):
+        # 长时间显示监控和等待菜单输入时不持有写锁，允许另一终端实时调整限速。
+        with management_lock():
+            if command == "monitor":
+                ensure_monitor()
+            else:
+                actions[command]()
+        if command == "monitor":
+            try:
+                monitor(once=args.once)
+            except KeyboardInterrupt:
+                print("\n已退出显示，监控和限速仍在后台生效。")
     if args.command != "menu":
-        actions[args.command]()
+        dispatch(args.command)
         return
     options = [("安装", "install"), ("查看节点 / 导出配置", "export"), ("修改配置", "configure"),
                ("发布 / 刷新 HTTPS 订阅", "publish"), ("撤销订阅", "unpublish"), ("诊断", "doctor"),
                ("查看日志", "logs"), ("重启", "restart"), ("停止", "stop"),
-               ("更新官方内核", "update"), ("备份配置", "backup"), ("卸载", "uninstall")]
+               ("更新官方内核", "update"), ("备份配置", "backup"), ("卸载", "uninstall"),
+               ("客户端 IP 实时流量", "monitor"), ("设置 IP 上下行限速", "limit"),
+               ("取消 IP 限速", "unlimit"), ("查看限速配置", "limits"), ("关闭监控和限速", "monitor-off")]
     while True:
         print(f"\nHY {VERSION} — Hysteria2 中文管理")
         for i, (label, _) in enumerate(options, 1):
@@ -724,7 +971,7 @@ def main():
             return
         if selection.isdigit() and 1 <= int(selection) <= len(options):
             try:
-                actions[options[int(selection) - 1][1]]()
+                dispatch(options[int(selection) - 1][1])
             except Exception as exc:
                 print(f"操作失败：{exc}", file=sys.stderr)
         else:

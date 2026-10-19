@@ -9,7 +9,7 @@
 以 root 执行固定版本的安装器：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/demonyxp/hy/v0.2.0/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/demonyxp/hy/v0.3.0/install.sh)
 ```
 
 先选择安装模式：
@@ -46,7 +46,7 @@ Mihomo、sing-box 和官方内核已测试错误证书/指纹会拒绝连接。�
 
 域名模式检查证书链、域名、有效期和私钥匹配。两种模式均检查 UDP 端口占用，下载官方稳定版并校验 GitHub 提供的 SHA-256。它使用独立的 `hy-server.service` 和 `/etc/hy`，不覆盖 s-hy2 的 `/etc/hysteria` 或 3x-ui。
 
-已有 v0.1.0 用户重复执行上述安装命令即可更新管理器，保留原配置。需要切换模式时运行 `hy configure`；切换后重新导入配置或更新订阅。
+已有旧版用户重复执行上述安装命令即可更新管理器，保留原配置。需要切换模式时运行 `hy configure`；切换后重新导入配置或更新订阅。
 
 在云安全组、宝塔防火墙放行 **UDP 24443**（或你选择的端口）。如果系统用 UFW：
 
@@ -132,6 +132,45 @@ hy unpublish
 | `hy backup` | 备份配置、证书和发布信息 |
 | `hy uninstall` | 确认后卸载本工具，保留备份 |
 
+## 客户端 IP 监控与限速
+
+此功能只针对本工具配置的 **HY2 UDP 端口**，不会按 IP 限制整个服务器。IPv4 / IPv6 都支持，不新增网页面板或外部监听端口。安装器会安装 nftables 命令，但只有执行 `hy monitor` 或 `hy limit` 才启用规则。
+
+```bash
+# 实时显示各客户端公网 IP 的上传/下载 Mbps、累计 MiB 和限速配置
+hy monitor
+
+# 采样 2 秒，打印一次后退出
+hy monitor --once
+
+# 为客户端公网 IP 设置上传 10 Mbps、下载 30 Mbps
+hy limit 203.0.113.7 --upload 10 --download 30
+
+# 只修改下载上限，保留原上传上限
+hy limit 203.0.113.7 --download 5
+
+# IPv6 示例；0 表示不限速
+hy limit 2001:db8::7 --upload 0 --download 10
+
+# 查看、取消限速
+hy limits
+hy unlimit 203.0.113.7
+
+# 关闭整个监控和限速功能
+hy monitor-off
+```
+
+也可以在中文菜单选择“客户端 IP 实时流量”或“设置 IP 上下行限速”。不带参数的 `hy limit` 会交互询问 IP 和上下行上限。
+
+- **方向以客户端为准**：上传是客户端 → 服务器，下载是服务器 → 客户端。单位 Mbps 是兆比特/秒，8 Mbps 约等于 1 MB/s。
+- 监控统计通过专用规则的 IP 层字节，包含加密及协议开销，不包含本限速规则丢弃的包。它反映访问 HY2 UDP 端口的 IP，不能单独证明该 IP 已通过密码认证；不是全服务器网卡统计。
+- 同一公网 IP 下的设备共用一个统计项和限速额度；IP 变化后需要重新设置对应规则。只支持单个 IP，不接受网段或域名。
+- 通过 nftables 令牌桶丢弃超额包，允许短时突发，不是平滑排队整形。HY2 会受到丢包和拥塞控制影响，实际下载速度可能低于所设上限；入站包已经抵达服务器，所以不能靠这个功能减少云厂商收到的入站流量计费。
+- 配置保存在 `/etc/hy/state.json`，由 `hy-traffic.service` 开机恢复。修改 HY2 端口时同步调整规则，失败时回滚。这里只操作带归属标记的 `inet hy_traffic` 表，不清空已有防火墙，不自动放行端口，不改 SSH/Nginx 或全局网卡队列。
+- **Ctrl+C 只退出显示**，后台计数和限速继续；`hy stop` 只停止 VPN 服务。`hy monitor-off` 删除专用规则并禁用其开机恢复，保留限速配置；再次运行 `hy monitor` 会恢复这些限速。需要永久取消某个 IP 的限速请用 `hy unlimit`。
+- 累计数据保存在内核，不是历史账单：服务器重启、关闭监控或外部工具清空规则后会重置；每个 IP 的单方向计数在该方向空闲 24 小时后过期，每个方向/地址族最多 65536 项。调整限速保留现有流量计数。
+- 外部防火墙工具若清空 nftables 规则，监控/限速会失效；`hy limits` 会显示规则缺失，重新运行 `hy monitor` 可恢复。内核不支持 nftables 或无 NET_ADMIN 权限时命令会报错，不会声称已限速。
+
 ## 证书续期
 
 域名模式的证书仍由宝塔或你原有的 ACME 工具续期。`hy-cert-sync.timer` 每小时读取一次源证书，验证后同步到本工具专用目录；自签模式只校验和同步原证书，不自动更换指纹。使用独立低权限账户运行 Hysteria2，不修改宝塔私钥文件权限。整对证书通过符号链接原子切换；新握手会读取更新后的证书。
@@ -149,13 +188,13 @@ journalctl -u hy-cert-sync.service -n 30 --no-pager
 - `hy update` 替换前备份旧内核；重启失败则恢复。
 - 备份位于 `/var/lib/hy/backups/`，包含密码和私钥，仅 root 可访问；按需要自行清理旧备份。
 - 卸载只清理本工具专用路径与带归属标记的订阅文件，保留备份、专用系统账户和运行目录；可再次安装复用。
-- 同一时间只允许一个 `hy` 操作，证书同步与手动配置不会并发写入。
+- 同一时间只允许一个配置修改操作；监控显示和菜单等待不占写锁，可在另一终端调整限速。
 
 **服务运行、TCP 可达、服务器下载快都不能证明客户端 HY2 可用。** 最后必须用导出的客户端配置测试真实 UDP 握手、访问网站和出口 IP。若超时，先检查 UDP 安全组、系统防火墙、CDN、DNS 和运营商线路。
 
 ## 项目范围与测试
 
-这是单节点部署工具，不提供网页面板、多用户计费、流量套餐、自动改防火墙、自动卸载其他 VPN 或自动接管宝塔。
+这是单节点部署工具，不提供网页面板、多用户计费、流量套餐、自动放行端口、自动卸载其他 VPN 或自动接管宝塔。客户端 IP 监控/限速仅在主动启用时写入自己的 nftables 表。
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -170,6 +209,7 @@ docker build -f tests/Dockerfile -t hy-test .
 docker run -d --name hy-test --privileged --cgroupns=private \
   --tmpfs /run --tmpfs /run/lock -e HY_DISPOSABLE_TEST=1 hy-test
 docker exec hy-test python3 -u tests/live_systemd.py
+docker exec hy-test python3 -u tests/live_traffic.py
 docker rm -f hy-test
 ```
 
@@ -178,5 +218,7 @@ docker rm -f hy-test
 v0.1.0 已在 Ubuntu 24.04 amd64 / Hysteria2 2.13.0 验证，客户端内核验证为 Mihomo 1.19.32 和 sing-box 1.14.3，包含开启/关闭混淆的真实代理请求。未对每个图形客户端逐一执行界面导入测试；其他支持平台仍需在实际服务器验证。
 
 v0.2.0 在上述环境补充通过纯 IP 自动自签安装、三种客户端内核连接、混淆开关、错误指纹/证书拒绝、证书保持不变和切回原有证书模式测试。10 项单元测试在 Linux 全部通过。
+
+v0.3.0 的 15 项 Linux 单元测试通过，真实内核测试覆盖 HY2 计数、IPv4/IPv6 上下行限速、取消限速、端口迁移、规则原子更新失败、开机配置恢复、监控与修改并发、卸载清理，以及其他 IP/端口/TCP/防火墙表不受影响。
 
 参考：[Hysteria2 官方](https://github.com/HyNetworks/hysteria)、[服务端配置](https://v2.hysteria.network/zh/docs/advanced/Full-Server-Config/)、[节点 URI](https://v2.hysteria.network/docs/developers/URI-Scheme/)、[Mihomo Hysteria2 配置](https://wiki.metacubex.one/config/proxies/hysteria2/)、[sing-box Hysteria2 配置](https://sing-box.sagernet.org/configuration/outbound/hysteria2/)。

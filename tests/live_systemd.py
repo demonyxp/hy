@@ -94,6 +94,14 @@ with tempfile.TemporaryDirectory(prefix="hy-live-") as tmp:
         connect(installed)
         print("PASS: install / systemd low-privilege service / real HY2 proxy request")
         check_clients(hy, installed)
+        with contextlib.redirect_stdout(io.StringIO()):
+            hy.ensure_monitor()
+            hy.set_limit("127.0.0.1", upload="1000", download="1000")
+        installed = hy.load_state()
+        connect(installed)
+        totals = hy.traffic_snapshot(hy.nft_table())["127.0.0.1"]
+        assert totals["upload"] > 0 and totals["download"] > 0
+        print("PASS: real HY2 connection with IP counters and limits")
 
         # 故意写入无效的监听地址，验证启动失败后的真实回滚和权限恢复。
         valid_builder = hy.server_config
@@ -163,6 +171,7 @@ with tempfile.TemporaryDirectory(prefix="hy-live-") as tmp:
         assert not hy.ETC.exists() and not hy.BIN.exists()
         assert (hy.DATA / "backups").is_dir()
         assert not hy.service_active()
+        assert hy.nft_table() is None
         print("PASS: uninstall retains backups")
 
         def reuse_download(destination):
