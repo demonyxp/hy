@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # 固定管理器版本，避免一次安装混入不同版本的文件。
-VERSION=v0.1.0
+VERSION=v0.2.0
 if [[ ${EUID} -ne 0 ]]; then
     echo '请用 root 执行，或先运行 sudo -i。' >&2
     exit 1

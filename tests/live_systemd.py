@@ -36,7 +36,7 @@ class TestHTTP(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def connect(state):
+def connect(state, reject=False):
     config = json.loads(hy.client_files(state)["native.json"])
     config["socks5"]["listen"] = "127.0.0.1:18081"
     config_path = Path("/tmp/hy-live-client.json")
@@ -44,16 +44,18 @@ def connect(state):
     with open("/tmp/hy-live-client.log", "w") as log:
         client = subprocess.Popen([str(hy.BIN), "client", "-c", str(config_path)], stdout=log, stderr=log)
         try:
-            for _ in range(20):
+            for _ in range(3 if reject else 20):
                 time.sleep(0.2)
                 result = subprocess.run(["curl", "-fsS", "--noproxy", "", "--proxy", "socks5h://127.0.0.1:18081",
                                          "--max-time", "3", "http://127.0.0.1:18080/"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 if result.returncode == 0:
+                    assert not reject, "错误指纹不应建立连接"
                     assert result.stdout == b"hy-end-to-end-ok"
                     return
                 if client.poll() is not None:
                     break
-            raise AssertionError("真实 HY2 握手失败；查看 /tmp/hy-live-client.log")
+            if not reject:
+                raise AssertionError("真实 HY2 握手失败；查看 /tmp/hy-live-client.log")
         finally:
             client.terminate()
             client.wait(timeout=10)
@@ -172,5 +174,38 @@ with tempfile.TemporaryDirectory(prefix="hy-live-") as tmp:
             hy.install()
         connect(hy.load_state())
         print("PASS: reinstall after uninstall")
+
+        # 纯 IP 首次安装：不提供域名证书，不把自签证书加入系统 CA。
+        with patch.object(hy, "prompt", return_value="UNINSTALL"), contextlib.redirect_stdout(io.StringIO()):
+            hy.uninstall()
+        ip_state = {**state, "cert_mode": "selfsigned", "domain": "hy.invalid",
+                    "cert_source": str(hy.ETC / "selfsigned/fullchain.pem"),
+                    "key_source": str(hy.ETC / "selfsigned/privkey.pem")}
+        with patch.object(hy, "collect_state", return_value=ip_state), \
+             patch.object(hy, "download_core", side_effect=reuse_download), contextlib.redirect_stdout(io.StringIO()):
+            hy.install()
+        installed_ip = hy.load_state()
+        assert "cert_sha256" in installed_ip
+        connect(installed_ip)
+        check_clients(hy, installed_ip)
+        print("PASS: IP-only install without trusted certificate / pinned clients")
+        fingerprint = installed_ip["cert_sha256"]
+        hy.sync_certificate(installed_ip)
+        assert hy.load_state()["cert_sha256"] == fingerprint
+        changed_ip = {**installed_ip, "obfs": "selfsigned-obfs-test"}
+        with patch.object(hy, "collect_state", return_value=changed_ip), contextlib.redirect_stdout(io.StringIO()):
+            hy.configure()
+        assert hy.load_state()["cert_sha256"] == fingerprint
+        connect(hy.load_state())
+        check_clients(hy, hy.load_state())
+        wrong = {**hy.load_state(), "cert_sha256": "0" * 64, "cert_pem": cert.read_text()}
+        connect(wrong, reject=True)
+        check_clients(hy, wrong, reject=True)
+        print("PASS: stable self-signed certificate / obfs / wrong certificate rejected")
+        # 从自签模式切回原有证书模式，旧版配置仍应正常工作。
+        with patch.object(hy, "collect_state", return_value=state), contextlib.redirect_stdout(io.StringIO()):
+            hy.configure()
+        connect(hy.load_state())
+        print("PASS: switch IP mode back to existing certificate")
     finally:
         httpd.shutdown()

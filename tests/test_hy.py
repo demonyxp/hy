@@ -20,6 +20,38 @@ def fixture():
 
 
 class ConfigTests(unittest.TestCase):
+    def test_ip_mode_needs_no_domain_or_existing_certificate(self):
+        answers = ["2", "203.0.113.10", "24443", "test-password-123456", "IP节点", "n"]
+        with patch.object(hy, "prompt", side_effect=answers), patch.object(hy, "check_certificate") as check:
+            state = hy.collect_state()
+        self.assertEqual(state["cert_mode"], "selfsigned")
+        self.assertEqual(state["server"], "203.0.113.10")
+        self.assertEqual(state["domain"], "hy.invalid")
+        check.assert_not_called()
+        self.assertEqual(hy.ip_literal("[2001:db8::1]"), "2001:db8::1")
+        for value in ("example.com", "https://1.2.3.4", "1.2.3.4:443", "fe80::1%eth0"):
+            with self.assertRaises(ValueError):
+                hy.ip_literal(value)
+
+    def test_self_signed_exports_keep_certificate_identity(self):
+        state = {**fixture(), "cert_mode": "selfsigned", "domain": "hy.invalid",
+                 "cert_sha256": "a" * 64, "cert_pem": "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n"}
+        files = hy.client_files(state)
+        query = parse_qs(urlsplit(files["node.txt"].strip()).query)
+        self.assertEqual(query["insecure"], ["1"])
+        self.assertEqual(query["pinSHA256"], [state["cert_sha256"]])
+        node = json.loads(files["clash.yaml"])["proxies"][0]
+        self.assertTrue(node["skip-cert-verify"])
+        self.assertEqual(node["fingerprint"], state["cert_sha256"])
+        native = json.loads(files["native.json"])["tls"]
+        self.assertEqual(native["pinSHA256"], state["cert_sha256"])
+        tls = json.loads(files["sing-box.json"])["outbounds"][0]["tls"]
+        self.assertFalse(tls["insecure"])
+        self.assertEqual(tls["certificate"], state["cert_pem"].splitlines())
+        del state["cert_sha256"]
+        with self.assertRaises(ValueError):
+            hy.client_files(state)
+
     def test_special_characters_round_trip_across_clients(self):
         state = fixture()
         files = hy.client_files(state)

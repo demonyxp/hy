@@ -6,7 +6,7 @@ import tempfile
 import time
 
 
-def check_clients(hy, state):
+def check_clients(hy, state, reject=False):
     binaries = {"sing-box": Path("/opt/test-clients/sing-box"), "mihomo": Path("/opt/test-clients/mihomo")}
     for kind, binary in binaries.items():
         if not binary.is_file():
@@ -38,7 +38,7 @@ def check_clients(hy, state):
                 client = subprocess.Popen(command, stdout=log, stderr=log)
                 try:
                     success = False
-                    for _ in range(20):
+                    for _ in range(3 if reject else 20):
                         time.sleep(0.2)
                         result = subprocess.run(
                             ["curl", "-fsS", "--noproxy", "", "--proxy", "socks5h://127.0.0.1:18082",
@@ -48,8 +48,8 @@ def check_clients(hy, state):
                             break
                         if client.poll() is not None:
                             break
-                    assert success, (root / "client.log").read_text()
+                    assert success != reject, (root / "client.log").read_text()
                 finally:
                     client.terminate()
                     client.wait(timeout=10)
-            print(f"PASS: {kind} full config validation / real HY2 proxy / obfs={bool(state.get('obfs'))}")
+            print(f"PASS: {kind} / {'reject wrong certificate' if reject else 'full config and real HY2 proxy'} / obfs={bool(state.get('obfs'))}")

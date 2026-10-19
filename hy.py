@@ -22,7 +22,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 REPO = "HyNetworks/hysteria"
 ETC = Path("/etc/hy")
 LIB = Path("/usr/local/lib/hy")
@@ -114,7 +114,7 @@ def load_state():
     return state
 
 
-def check_certificate(cert, key, hostname):
+def check_certificate(cert, key, hostname, self_signed=False):
     cert, key = Path(cert), Path(key)
     if not cert.is_file() or not key.is_file():
         raise ValueError("证书或私钥不存在；请先在宝塔申请域名证书，或输入已有证书路径。")
@@ -126,22 +126,51 @@ def check_certificate(cert, key, hostname):
     key_pub = output(["openssl", "pkey", "-in", key, "-passin", "pass:", "-pubout"])
     if cert_pub != key_pub:
         raise ValueError("证书与私钥不匹配。")
-    # 使用系统 CA 校验证书链，防止生成客户端无法校验的节点。
+    # 域名模式使用系统 CA；自签模式只信任本工具生成的证书。
     run(["openssl", "verify", "-purpose", "sslserver", "-verify_hostname", hostname,
-         "-CApath", "/etc/ssl/certs", "-untrusted", cert, cert],
+         *(["-CAfile", cert] if self_signed else ["-CApath", "/etc/ssl/certs"]),
+         "-untrusted", cert, cert],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+def ip_literal(value):
+    try:
+        if "%" in value:
+            raise ValueError()
+        return str(ipaddress.ip_address(value.strip().strip("[]")))
+    except ValueError as exc:
+        raise ValueError("请输入服务器 IPv4 或 IPv6 地址，不要填写域名、端口或网址。") from exc
 
 
 def collect_state(old=None):
     old = old or {}
-    host = ask_valid("证书域名（需要已解析到本机）", domain, old.get("domain"))
-    address = ask_valid("客户端连接地址（域名或公网 IP）", endpoint, old.get("server", host))
+    def mode_value(value):
+        if value not in ("1", "2"):
+            raise ValueError("请输入 1 或 2。")
+        return value
+    mode = ask_valid("安装模式：1=域名/已有证书，2=纯 IP/自动自签证书", mode_value,
+                     "2" if old.get("cert_mode") == "selfsigned" else "1")
+    self_signed = mode == "2"
+    if self_signed:
+        host = "hy.invalid"
+        old_ip = old.get("server", "")
+        try:
+            old_ip = ip_literal(old_ip)
+        except ValueError:
+            old_ip = None
+        address = ask_valid("服务器公网 IP", ip_literal, old_ip)
+        cert, key = str(ETC / "selfsigned/fullchain.pem"), str(ETC / "selfsigned/privkey.pem")
+        print("将自动生成并固定自签证书；不需要域名、宝塔或现成证书。")
+    else:
+        previous = old if old.get("cert_mode") != "selfsigned" else {}
+        host = ask_valid("证书域名（需要已解析到本机）", domain, previous.get("domain"))
+        address = ask_valid("客户端连接地址（域名或公网 IP）", endpoint, previous.get("server", host))
+        cert_default = previous.get("cert_source", f"/www/server/panel/vhost/cert/{host}/fullchain.pem")
+        key_default = previous.get("key_source", f"/www/server/panel/vhost/cert/{host}/privkey.pem")
+        cert = str(Path(prompt("证书完整路径", cert_default)).expanduser().resolve())
+        key = str(Path(prompt("私钥完整路径", key_default)).expanduser().resolve())
+        check_certificate(cert, key, host)
     port = ask_valid("Hysteria2 UDP 端口", port_number, old.get("port", 24443))
-    cert_default = old.get("cert_source", f"/www/server/panel/vhost/cert/{host}/fullchain.pem")
-    key_default = old.get("key_source", f"/www/server/panel/vhost/cert/{host}/privkey.pem")
-    cert = str(Path(prompt("证书完整路径", cert_default)).expanduser().resolve())
-    key = str(Path(prompt("私钥完整路径", key_default)).expanduser().resolve())
-    check_certificate(cert, key, host)
     password = prompt("节点密码（回车保留或自动生成）", secret=True) or old.get("password") or secrets.token_urlsafe(24)
     if len(password) < 16 or any(ord(c) < 32 for c in password):
         raise ValueError("密码至少 16 个字符，不能包含控制字符。")
@@ -150,6 +179,7 @@ def collect_state(old=None):
         raise ValueError("节点名称不能超过 80 字符、包含控制字符或使用保留名称。")
     obfs = prompt("启用 Salamander 混淆？y/N", "y" if old.get("obfs") else "n").lower() == "y"
     return {**old, "owner": MARKER, "domain": host, "server": address, "port": port,
+            "cert_mode": "selfsigned" if self_signed else "existing",
             "cert_source": cert, "key_source": key, "password": password, "name": name,
             "obfs": (old.get("obfs") or secrets.token_urlsafe(24)) if obfs else ""}
 
@@ -178,6 +208,14 @@ def client_files(state):
     outbound = {"type": "hysteria2", "tag": "proxy", "server": host,
                 "server_port": state["port"], "password": state["password"],
                 "tls": {"enabled": True, "server_name": state["domain"], "insecure": False}}
+    if state.get("cert_mode") == "selfsigned":
+        fingerprint = state.get("cert_sha256", "")
+        if not re.fullmatch(r"[0-9a-f]{64}", fingerprint) or not state.get("cert_pem"):
+            raise ValueError("自签证书尚未生成，不能导出无证书校验的节点。")
+        query.update({"insecure": "1", "pinSHA256": fingerprint})
+        node.update({"skip-cert-verify": True, "fingerprint": fingerprint})
+        native["tls"].update({"insecure": True, "pinSHA256": fingerprint})
+        outbound["tls"]["certificate"] = state["cert_pem"].splitlines()
     if state.get("obfs"):
         query.update({"obfs": "salamander", "obfs-password": state["obfs"]})
         node.update({"obfs": "salamander", "obfs-password": state["obfs"]})
@@ -278,8 +316,35 @@ def group_id():
     return grp.getgrnam(USER).gr_gid
 
 
+def prepare_self_signed(state):
+    cert, key = Path(state["cert_source"]), Path(state["key_source"])
+    if not cert.exists() and not key.exists():
+        if state.get("cert_sha256"):
+            raise ValueError("原自签证书丢失，请从备份恢复，避免已导入的指纹失效。")
+        cert.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="hy-cert-") as tmp:
+            new_cert, new_key = Path(tmp) / "cert.pem", Path(tmp) / "key.pem"
+            run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                 "-nodes", "-keyout", new_key, "-out", new_cert, "-days", "3650",
+                 "-subj", "/CN=hy.invalid", "-addext", "subjectAltName=DNS:hy.invalid",
+                 "-addext", "extendedKeyUsage=serverAuth", "-addext", "basicConstraints=critical,CA:TRUE"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            atomic_write(cert, new_cert.read_bytes())
+            atomic_write(key, new_key.read_bytes())
+    check_certificate(cert, key, state["domain"], self_signed=True)
+    der = run(["openssl", "x509", "-in", cert, "-outform", "DER"], stdout=subprocess.PIPE).stdout
+    fingerprint = hashlib.sha256(der).hexdigest()
+    if state.get("cert_sha256") and state["cert_sha256"] != fingerprint:
+        raise ValueError("自签证书指纹发生变化，已停止同步；请恢复原证书。")
+    state["cert_sha256"] = fingerprint
+    state["cert_pem"] = cert.read_text()
+
+
 def sync_certificate(state):
-    check_certificate(state["cert_source"], state["key_source"], state["domain"])
+    if state.get("cert_mode") == "selfsigned":
+        prepare_self_signed(state)
+    else:
+        check_certificate(state["cert_source"], state["key_source"], state["domain"])
     cert = Path(state["cert_source"]).read_bytes()
     key = Path(state["key_source"]).read_bytes()
     digest = hashlib.sha256(cert + key).hexdigest()
@@ -426,7 +491,9 @@ def install():
     export_files(state)
     firewall_hint(state)
     print("\n安装完成。输入 hy 打开中文菜单。服务启动成功不代表公网 UDP 已放行。")
-    if prompt("是否发布订阅到已有 HTTPS 网站？y/N", "n").lower() == "y":
+    if state.get("cert_mode") == "selfsigned":
+        print("纯 IP 模式可直接导入节点链接/本地配置，无需网站。已有 HTTPS 网站时可另运行 hy publish。")
+    elif prompt("是否发布订阅到已有 HTTPS 网站？y/N", "n").lower() == "y":
         publish()
 
 
@@ -532,9 +599,10 @@ def publish():
         print("刷新当前订阅文件。要换发布位置，请先运行 hy unpublish。")
     else:
         print("文件包含节点凭据，随机路径就是订阅密钥；使用你自己的现有 HTTPS 网站。")
+        self_signed = state.get("cert_mode") == "selfsigned"
         state["publication"] = publication_settings(
-            prompt("宝塔站点根目录", f"/www/wwwroot/{state['domain']}"),
-            prompt("站点 HTTPS 根地址", f"https://{state['domain']}"))
+            prompt("已有网站根目录", None if self_signed else f"/www/wwwroot/{state['domain']}"),
+            prompt("站点 HTTPS 根地址", None if self_signed else f"https://{state['domain']}"))
     # 先保存归属信息，网络验证失败时仍可撤销发布。
     atomic_write(STATE, json_text(state))
     publish_files(state)
@@ -577,8 +645,12 @@ def doctor():
     print(f"管理器 {VERSION} / 内核 {state.get('core_version', '未知')}")
     print("服务：" + ("运行中" if service_active() else "未运行"))
     print(f"UDP {state['port']} 监听：" + ("存在" if output(["ss", "-H", "-lun", f"sport = :{state['port']}"]) else "不存在"))
-    check_certificate(state["cert_source"], state["key_source"], state["domain"])
-    print("源证书：域名、有效期、私钥匹配、系统 CA 校验通过")
+    if state.get("cert_mode") == "selfsigned":
+        prepare_self_signed(state)
+        print("自签证书：有效期、私钥匹配、固定指纹校验通过（不依赖公共 CA）")
+    else:
+        check_certificate(state["cert_source"], state["key_source"], state["domain"])
+        print("源证书：域名、有效期、私钥匹配、系统 CA 校验通过")
     print(output(["systemctl", "is-enabled", "hy-cert-sync.timer"]))
     try:
         addresses = sorted({x[4][0] for x in socket.getaddrinfo(state["server"], state["port"])})
