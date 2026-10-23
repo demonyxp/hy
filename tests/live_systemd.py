@@ -13,6 +13,7 @@ import threading
 import time
 from unittest.mock import patch
 from client_cores import check_clients
+from legacy_upgrade import check_upgrades
 
 if os.environ.get("HY_DISPOSABLE_TEST") != "1" or not Path("/.dockerenv").exists():
     raise SystemExit("拒绝运行：仅限设置 HY_DISPOSABLE_TEST=1 的一次性 Docker 容器。")
@@ -85,7 +86,7 @@ with tempfile.TemporaryDirectory(prefix="hy-live-") as tmp:
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
         # 在隔离容器里实际下载、校验、创建账户、安装并启动 systemd 服务。
-        with patch.object(hy, "collect_state", return_value=state), patch.object(hy, "prompt", return_value="n"), \
+        with patch.object(hy, "installation_state", return_value=state), patch.object(hy, "prompt", return_value="n"), \
              contextlib.redirect_stdout(io.StringIO()):
             hy.install()
         assert hy.service_active()
@@ -149,7 +150,7 @@ with tempfile.TemporaryDirectory(prefix="hy-live-") as tmp:
 
         # 发布只允许指定随机目录，撤销时保留用户原有网站文件。
         webroot = Path("/var/www/hy-disposable")
-        webroot.mkdir(parents=True)
+        webroot.mkdir(parents=True, exist_ok=True)
         (webroot / "index.html").write_text("keep existing website")
         published = hy.load_state()
         published["publication"] = hy.publication_settings(str(webroot), "https://vpn.example.test")
@@ -178,7 +179,7 @@ with tempfile.TemporaryDirectory(prefix="hy-live-") as tmp:
             shutil.copy2(core_copy, destination)
             return installed["core_version"]
 
-        with patch.object(hy, "collect_state", return_value=state), patch.object(hy, "download_core", side_effect=reuse_download), \
+        with patch.object(hy, "installation_state", return_value=state), patch.object(hy, "download_core", side_effect=reuse_download), \
              patch.object(hy, "prompt", return_value="n"), contextlib.redirect_stdout(io.StringIO()):
             hy.install()
         connect(hy.load_state())
@@ -187,10 +188,8 @@ with tempfile.TemporaryDirectory(prefix="hy-live-") as tmp:
         # 纯 IP 首次安装：不提供域名证书，不把自签证书加入系统 CA。
         with patch.object(hy, "prompt", return_value="UNINSTALL"), contextlib.redirect_stdout(io.StringIO()):
             hy.uninstall()
-        ip_state = {**state, "cert_mode": "selfsigned", "domain": "hy.invalid",
-                    "cert_source": str(hy.ETC / "selfsigned/fullchain.pem"),
-                    "key_source": str(hy.ETC / "selfsigned/privkey.pem")}
-        with patch.object(hy, "collect_state", return_value=ip_state), \
+        with patch.object(hy, "detect_public_ip", return_value="127.0.0.1"), \
+             patch.object(hy, "prompt", side_effect=["1", "2", "y"]), \
              patch.object(hy, "download_core", side_effect=reuse_download), contextlib.redirect_stdout(io.StringIO()):
             hy.install()
         installed_ip = hy.load_state()
@@ -216,5 +215,6 @@ with tempfile.TemporaryDirectory(prefix="hy-live-") as tmp:
             hy.configure()
         connect(hy.load_state())
         print("PASS: switch IP mode back to existing certificate")
+        check_upgrades(hy, state, reuse_download, connect)
     finally:
         httpd.shutdown()

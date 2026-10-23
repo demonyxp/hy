@@ -22,7 +22,7 @@ def fixture():
 class ConfigTests(unittest.TestCase):
     def test_ip_mode_needs_no_domain_or_existing_certificate(self):
         answers = ["2", "203.0.113.10", "24443", "test-password-123456", "IP节点", "n"]
-        with patch.object(hy, "prompt", side_effect=answers), patch.object(hy, "check_certificate") as check:
+        with patch.object(hy, "prompt", side_effect=answers), patch.object(hy, "check_port"), patch.object(hy, "check_certificate") as check:
             state = hy.collect_state()
         self.assertEqual(state["cert_mode"], "selfsigned")
         self.assertEqual(state["server"], "203.0.113.10")

@@ -15,6 +15,7 @@ from pathlib import Path
 import platform
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -24,7 +25,8 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
+MANAGER_URL = "https://raw.githubusercontent.com/demonyxp/hy"
 REPO = "HyNetworks/hysteria"
 ETC = Path("/etc/hy")
 LIB = Path("/usr/local/lib/hy")
@@ -96,6 +98,8 @@ def port_number(value):
 
 
 def prompt(label, default=None, secret=False):
+    if not sys.stdin.isatty():
+        raise ValueError("此操作需要交互终端，请登录服务器后执行 hy；SSH 请使用 ssh -t。")
     hint = f" [{default}]" if default is not None and not secret else ""
     value = (getpass.getpass if secret else input)(f"{label}{hint}: ").strip()
     return value or default or ""
@@ -103,8 +107,9 @@ def prompt(label, default=None, secret=False):
 
 def ask_valid(label, validator, default=None):
     while True:
+        value = prompt(label, default)
         try:
-            return validator(prompt(label, default))
+            return validator(value)
         except ValueError as exc:
             print(exc)
 
@@ -146,6 +151,73 @@ def ip_literal(value):
         raise ValueError("请输入服务器 IPv4 或 IPv6 地址，不要填写域名、端口或网址。") from exc
 
 
+def choice(label, values, default):
+    def validate(value):
+        value = value.lower()
+        if value not in values:
+            raise ValueError("请选择：" + "/".join(values))
+        return value
+    return ask_valid(label, validate, default)
+
+
+def public_ip(value):
+    address = ip_literal(value)
+    if not ipaddress.ip_address(address).is_global:
+        raise ValueError("请输入可供客户端连接的公网 IP。")
+    return address
+
+
+def detect_public_ip():
+    # 只接受 HTTPS 返回的公网字面量；IPv4 优先，失败后尝试 IPv6。
+    for family in ("-4", "-6"):
+        for url in ("https://api64.ipify.org", "https://ifconfig.co/ip"):
+            try:
+                return public_ip(output(["curl", family, "-fsS", "--noproxy", "*",
+                                         "--proto", "=https", "--connect-timeout", "3",
+                                         "--max-time", "5", url]))
+            except (ValueError, OSError, subprocess.SubprocessError):
+                continue
+    return None
+
+
+def free_port():
+    for port in range(24443, 24454):
+        if not output(["ss", "-H", "-lun", f"sport = :{port}"]):
+            return port
+    return ask_valid("默认端口段已占用，请指定 UDP 端口", available_port)
+
+
+def available_port(value, old=None):
+    port = port_number(value)
+    check_port(port, old)
+    return port
+
+
+def quick_state():
+    print("正在识别公网 IP…")
+    address = detect_public_ip()
+    if not address:
+        address = ask_valid("未能自动识别，请输入服务器公网 IP", public_ip)
+    return {"owner": MARKER, "domain": "hy.invalid", "server": address,
+            "port": free_port(), "cert_mode": "selfsigned",
+            "cert_source": str(ETC / "selfsigned/fullchain.pem"),
+            "key_source": str(ETC / "selfsigned/privkey.pem"),
+            "password": secrets.token_urlsafe(24), "name": "我的-HY2", "obfs": ""}
+
+
+def installation_state():
+    mode = choice("1=快速安装（纯 IP），2=高级安装（域名或自定义）", ("1", "2"), "1")
+    state = quick_state() if mode == "1" else collect_state()
+    state["firewall_mode"] = "auto" if choice(
+        "本机防火墙：1=自动放行，2=手动放行（云安全组均需自行设置）", ("1", "2"), "1") == "1" else "manual"
+    print(f"\n连接地址：{state['server']}  UDP：{state['port']}  节点：{state['name']}")
+    print("证书：" + ("自动自签并固定身份" if state["cert_mode"] == "selfsigned" else "已有域名证书"))
+    print("防火墙：" + ("自动处理已启用的 UFW/firewalld" if state["firewall_mode"] == "auto" else "手动放行"))
+    if choice("确认部署？y/N（地址不正确请取消后选择高级安装）", ("y", "n"), "n") != "y":
+        raise ValueError("已取消安装，未写入节点配置。")
+    return state
+
+
 def collect_state(old=None):
     old = old or {}
     def mode_value(value):
@@ -171,17 +243,26 @@ def collect_state(old=None):
         address = ask_valid("客户端连接地址（域名或公网 IP）", endpoint, previous.get("server", host))
         cert_default = previous.get("cert_source", f"/www/server/panel/vhost/cert/{host}/fullchain.pem")
         key_default = previous.get("key_source", f"/www/server/panel/vhost/cert/{host}/privkey.pem")
-        cert = str(Path(prompt("证书完整路径", cert_default)).expanduser().resolve())
-        key = str(Path(prompt("私钥完整路径", key_default)).expanduser().resolve())
-        check_certificate(cert, key, host)
-    port = ask_valid("Hysteria2 UDP 端口", port_number, old.get("port", 24443))
-    password = prompt("节点密码（回车保留或自动生成）", secret=True) or old.get("password") or secrets.token_urlsafe(24)
-    if len(password) < 16 or any(ord(c) < 32 for c in password):
-        raise ValueError("密码至少 16 个字符，不能包含控制字符。")
-    name = prompt("节点名称", old.get("name", "我的-HY2"))
-    if len(name) > 80 or any(ord(c) < 32 for c in name) or name in ("DIRECT", "REJECT", "节点选择", "GLOBAL"):
-        raise ValueError("节点名称不能超过 80 字符、包含控制字符或使用保留名称。")
-    obfs = prompt("启用 Salamander 混淆？y/N", "y" if old.get("obfs") else "n").lower() == "y"
+        while True:
+            cert = str(Path(prompt("证书完整路径", cert_default)).expanduser().resolve())
+            key = str(Path(prompt("私钥完整路径", key_default)).expanduser().resolve())
+            try:
+                check_certificate(cert, key, host)
+                break
+            except (ValueError, subprocess.SubprocessError) as exc:
+                print(f"证书检查失败，请重新输入路径：{exc}")
+    port = ask_valid("Hysteria2 UDP 端口", lambda v: available_port(v, old), old.get("port", 24443))
+    while True:
+        password = prompt("节点密码（回车保留或自动生成）", secret=True) or old.get("password") or secrets.token_urlsafe(24)
+        if len(password) >= 16 and not any(ord(c) < 32 for c in password):
+            break
+        print("密码至少 16 个字符，不能包含控制字符。")
+    while True:
+        name = prompt("节点名称", old.get("name", "我的-HY2"))
+        if len(name) <= 80 and not any(ord(c) < 32 for c in name) and name not in ("DIRECT", "REJECT", "节点选择", "GLOBAL"):
+            break
+        print("节点名称不能超过 80 字符、包含控制字符或使用保留名称。")
+    obfs = choice("启用 Salamander 混淆？y/N", ("y", "n"), "y" if old.get("obfs") else "n") == "y"
     return {**old, "owner": MARKER, "domain": host, "server": address, "port": port,
             "cert_mode": "selfsigned" if self_signed else "existing",
             "cert_source": cert, "key_source": key, "password": password, "name": name,
@@ -263,6 +344,21 @@ def export_files(state, show=True):
         for name, label in SUBSCRIPTIONS.items():
             print(f"{label} 本地导入文件：{target / name}")
         print("这些文件含节点密码，请勿提交到 GitHub 或发给陌生人。")
+
+
+def export_client():
+    selected = choice("客户端：1=Hiddify，2=v2rayN，3=Clash/Mihomo/FlClash，4=sing-box，5=全部", ("1", "2", "3", "4", "5"), "1")
+    state = load_state()
+    export_files(state, show=selected == "5")
+    if selected in ("1", "2"):
+        print("复制以下链接，在客户端从剪贴板导入：\n" + client_files(state)["node.txt"])
+    elif selected in ("3", "4"):
+        name = "clash.yaml" if selected == "3" else "sing-box.json"
+        print(f"下载后在客户端导入配置文件：{DATA / 'export' / name}")
+    if selected != "5" and state.get("publication"):
+        name = {"1": "hiddify.txt", "2": "v2rayn.txt", "3": "clash.yaml", "4": "sing-box.json"}[selected]
+        print(f"已有订阅：{state['publication']['url']}/hy-sub-{state['publication']['token']}/{name}")
+    print("凭据只交给使用者；需要 HTTPS 订阅请在连接与订阅菜单中发布。")
 
 
 def release_asset(release, arch):
@@ -478,7 +574,7 @@ def install():
     else:
         if not retained:
             raise ValueError(f"已有系统账户 {USER}，请先确认归属。")
-    state = collect_state()
+    state = installation_state()
     check_port(state["port"])
     with tempfile.TemporaryDirectory(prefix="hy-core-") as tmp:
         candidate = Path(tmp) / "hysteria"
@@ -499,10 +595,12 @@ def install():
     run(["systemctl", "daemon-reload"])
     try:
         restart_checked()
+        firewall_apply(state)
         run(["systemctl", "enable", SERVICE, "hy-cert-sync.timer"])
         run(["systemctl", "start", "hy-cert-sync.timer"])
     except Exception:
         subprocess.run(["systemctl", "stop", SERVICE], check=False)
+        firewall_prune()
         print("安装未完成，文件已保留用于排障。运行 hy doctor / hy logs；修正后 hy start。", file=sys.stderr)
         raise
     export_files(state)
@@ -510,8 +608,8 @@ def install():
     print("\n安装完成。输入 hy 打开中文菜单。服务启动成功不代表公网 UDP 已放行。")
     if state.get("cert_mode") == "selfsigned":
         print("纯 IP 模式可直接导入节点链接/本地配置，无需网站。已有 HTTPS 网站时可另运行 hy publish。")
-    elif prompt("是否发布订阅到已有 HTTPS 网站？y/N", "n").lower() == "y":
-        publish()
+    else:
+        print("需要在线订阅时运行 hy publish，复用已有 HTTPS 网站。")
 
 
 def configure():
@@ -525,6 +623,7 @@ def configure():
         if old.get("traffic", {}).get("enabled"):
             apply_traffic(new)
         restart_checked()
+        firewall_apply(new)
     except Exception:
         restore_config(saved)
         if old.get("traffic", {}).get("enabled"):
@@ -533,8 +632,10 @@ def configure():
             restart_checked()
         else:
             run(["systemctl", "stop", SERVICE])
+        firewall_prune(old["port"])
         print("修改失败，已恢复修改前配置。", file=sys.stderr)
         raise
+    firewall_prune(new["port"])
     export_files(new)
     if new.get("publication"):
         publish_files(new)
@@ -565,6 +666,36 @@ def update():
         state["core_version"] = version
         atomic_write(STATE, json_text(state))
     print(f"内核已更新到 {version}，节点密码和端口保持不变。")
+
+
+def fetch_manager(url):
+    return run(["curl", "-fsSL", "--proto", "=https", "--proto-redir", "=https",
+                "--connect-timeout", "10", "--max-time", "60", "--retry", "2", url],
+               stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+
+
+def self_update():
+    load_state()
+    release = json.loads(fetch_manager(f"{MANAGER_URL}/main/release.json"))
+    version, digest = release.get("version", ""), release.get("sha256", "")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+        raise ValueError("管理器发布信息无效，保留旧版本。")
+    if tuple(map(int, version.split("."))) < tuple(map(int, VERSION.split("."))):
+        raise ValueError("发布信息版本低于当前版本，拒绝降级。")
+    content = fetch_manager(f"{MANAGER_URL}/v{version}/hy.py")
+    if hashlib.sha256(content).hexdigest() != digest:
+        raise ValueError("管理器 SHA-256 校验失败，保留旧版本。")
+    compile(content, "hy.py", "exec")
+    if f'VERSION = "{version}"'.encode() not in content:
+        raise ValueError("管理器版本与发布信息不匹配。")
+    target = LIB / "hy.py"
+    if target.read_bytes() == content:
+        print("管理器已是最新版本。")
+        return
+    saved = backup()
+    shutil.copy2(target, saved / "hy.py")
+    atomic_write(target, content, 0o755)
+    print(f"管理器已更新到 {version}；配置和服务状态保持不变。请重新运行 hy。")
 
 
 def publication_settings(webroot, base_url, token=None):
@@ -783,14 +914,14 @@ def monitor(once=False, interval=2):
         limits = load_state().get("traffic", {}).get("limits", {})
         if sys.stdout.isatty() and not once:
             print("\033[2J\033[H", end="")
-        print(f"\nHY2 客户端 IP 流量 {dt.datetime.now():%H:%M:%S}（Mbps；累计 MiB；↑上传 ↓下载）")
-        print(f"{'客户端 IP':<40} {'↑ Mbps':>10} {'↓ Mbps':>10} {'↑ MiB':>10} {'↓ MiB':>10}  限速↑/↓ Mbps")
+        print(f"\nHY2 客户端 IP 流量 {dt.datetime.now():%H:%M:%S}（↑客户端上传 ↓客户端下载；1 MB/s = 8 Mbps）")
+        print(f"{'客户端 IP':<40} {'↑ Mbps':>10} {'↓ Mbps':>10} {'↑ MB/s':>10} {'↓ MB/s':>10} {'↑ MiB':>10} {'↓ MiB':>10}  限速↑/↓ Mbps")
         for address, values in sorted(current.items(), key=lambda item: sum(item[1].values()), reverse=True):
             before = previous.get(address, {"upload": 0, "download": 0})
             rates = [max(0, values[d] - before[d]) * 8 / (now - last) / 1000000 for d in ("upload", "download")]
             limit = limits.get(address, {})
             label = "/".join(str(limit.get(d, "0")) if Decimal(str(limit.get(d, "0"))) else "不限" for d in ("upload", "download"))
-            print(f"{address:<40} {rates[0]:10.3f} {rates[1]:10.3f} {values['upload']/1048576:10.2f} {values['download']/1048576:10.2f}  {label}")
+            print(f"{address:<40} {rates[0]:10.3f} {rates[1]:10.3f} {rates[0]/8:10.3f} {rates[1]/8:10.3f} {values['upload']/1048576:10.2f} {values['download']/1048576:10.2f}  {label}")
         if not current:
             print("暂无流量，请连接节点并访问网站。")
         if once:
@@ -855,6 +986,120 @@ def management_lock():
         yield
 
 
+def firewall_backend():
+    active = []
+    try:
+        if shutil.which("ufw") and "Status: active" in output(["env", "LC_ALL=C", "ufw", "status"]):
+            active.append("ufw")
+        if shutil.which("firewall-cmd") and subprocess.run(
+                ["firewall-cmd", "--state"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            active.append("firewalld")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return active[0] if len(active) == 1 else None
+
+
+def firewall_records():
+    path = DATA / "firewall.json"
+    if not path.exists():
+        return []
+    value = json.loads(path.read_text())
+    if value.get("owner") != MARKER:
+        raise ValueError("防火墙记录归属不明，拒绝修改。")
+    return value["rules"]
+
+
+def save_firewall(records):
+    atomic_write(DATA / "firewall.json", json_text({"owner": MARKER, "rules": records}))
+
+
+def firewall_command(record, action):
+    port = port_number(record["port"])
+    if record["backend"] == "ufw":
+        return ["ufw", *(["--force", "delete"] if action == "remove" else []),
+                "allow", f"{port}/udp", "comment", record["comment"]]
+    return ["firewall-cmd", *(["--permanent"] if record["permanent"] else []),
+            f"--zone={record['zone']}", f"--{action}-port={port}/udp"]
+
+
+def firewall_prune(keep_port=None, only=None):
+    records = firewall_records()
+    for record in records[:]:
+        if record["port"] == keep_port or (only is not None and record not in only):
+            continue
+        try:
+            if record["backend"] == "ufw":
+                # 注释已变化说明用户接管了规则，不再删除。
+                present = record["comment"] in output(["ufw", "show", "added"])
+            else:
+                query = firewall_command(record, "query")
+                result = subprocess.run(query, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if result.returncode not in (0, 1):
+                    raise ValueError("firewalld 查询失败")
+                present = result.returncode == 0
+            if present:
+                run(firewall_command(record, "remove"), stdout=subprocess.DEVNULL)
+            records.remove(record)
+            save_firewall(records)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print(f"未能清理自建 UDP {record['port']} 规则，记录已保留，可用 hy firewall 重试：{exc}")
+    return records
+
+
+def firewall_apply(state):
+    if state.get("firewall_mode") != "auto":
+        return
+    backend = firewall_backend()
+    if backend is None:
+        print("未识别到唯一启用的 UFW/firewalld，未修改防火墙，请手动放行。")
+        return
+    records = firewall_records()
+    port = state["port"]
+    candidates = []
+    if backend == "ufw":
+        added = output(["ufw", "show", "added"])
+        if any(shlex.split(line)[:3] == ["ufw", "allow", f"{port}/udp"] for line in added.splitlines()):
+            print(f"UFW 已有 UDP {port} 放行规则，复用现有规则。")
+            return
+        candidates.append({"backend": backend, "port": port, "comment": "hy-" + secrets.token_hex(8)})
+    else:
+        active = output(["firewall-cmd", "--get-active-zones"])
+        # 新版 firewalld 会在区域名后附加 "(default)"。
+        zones = [line.split()[0] for line in active.splitlines() if line and not line[0].isspace()]
+        if len(zones) != 1:
+            print("firewalld 活跃区域不唯一，请手动选择区域放行，未修改规则。")
+            return
+        for permanent in (False, True):
+            record = {"backend": backend, "port": port, "zone": zones[0], "permanent": permanent}
+            result = subprocess.run(firewall_command(record, "query"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if result.returncode not in (0, 1):
+                raise ValueError("firewalld 查询失败，未添加规则。")
+            if result.returncode == 1:
+                candidates.append(record)
+    previous = records[:]
+    try:
+        for record in candidates:
+            # 先保存新增意图，意外退出后也能找到本工具负责的规则。
+            if record not in records:
+                records.append(record)
+            save_firewall(records)
+            run(firewall_command(record, "add"), stdout=subprocess.DEVNULL)
+    except Exception:
+        firewall_prune(only=[record for record in records if record not in previous])
+        raise
+    print(f"已处理本机 {backend} 的 UDP {port} 放行；云安全组仍需自行设置。")
+
+
+def firewall_setup():
+    state = load_state()
+    mode = choice("1=自动放行，2=手动放行并清理脚本自建规则", ("1", "2"), "1")
+    state["firewall_mode"] = "auto" if mode == "1" else "manual"
+    firewall_apply(state)
+    firewall_prune(state["port"] if mode == "1" else None)
+    atomic_write(STATE, json_text(state))
+    firewall_hint(state)
+
+
 def firewall_hint(state):
     print(f"\n请在云安全组和宝塔防火墙放行 UDP {state['port']}。")
     print(f"若正在使用 UFW，可执行：ufw allow {state['port']}/udp")
@@ -868,23 +1113,57 @@ def start():
     run(["systemctl", "enable", SERVICE])
 
 
+def status():
+    print(f"\nHY {VERSION} — Hysteria2 中文管理")
+    if not STATE.exists():
+        print("尚未安装；选择快速安装即可开始。")
+        return
+    state = load_state()
+    active = "运行中" if service_active() else "已停止"
+    enabled = subprocess.run(["systemctl", "is-enabled", "--quiet", SERVICE],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    print(f"服务：{active} | 开机启动：{'开启' if enabled else '关闭'} | 内核：{state.get('core_version', '未知')}")
+    mode = "纯 IP / 自签证书" if state.get("cert_mode") == "selfsigned" else "域名 / 已有证书"
+    print(f"模式：{mode} | 连接：{state['server']} UDP {state['port']}")
+
+
+def autostart(enabled):
+    load_state()
+    run(["systemctl", "enable" if enabled else "disable", SERVICE])
+    print("开机启动已" + ("开启" if enabled else "关闭") + "，当前运行状态不变。")
+
+
 def doctor():
     state = load_state()
+    def certificate():
+        signed = state.get("cert_mode") == "selfsigned"
+        check_certificate(state["cert_source"], state["key_source"], state["domain"], signed)
+        if signed:
+            der = run(["openssl", "x509", "-in", state["cert_source"], "-outform", "DER"], stdout=subprocess.PIPE).stdout
+            if hashlib.sha256(der).hexdigest() != state.get("cert_sha256"):
+                raise ValueError("自签证书指纹不匹配，请恢复原证书。")
+        return "证书和私钥检查通过"
+    def firewall():
+        backend = firewall_backend()
+        if not backend:
+            return "WARN: 未识别到唯一启用的 UFW/firewalld；需人工检查本机规则"
+        command = ["ufw", "status"] if backend == "ufw" else ["firewall-cmd", "--list-all-zones"]
+        return backend + "（请确认所用区域包含 UDP 端口）\n" + output(command)
+    checks = [("服务", lambda: service_active()),
+              (f"UDP {state['port']} 监听", lambda: bool(output(["ss", "-H", "-lun", f"sport = :{state['port']}"]))),
+              ("证书", certificate),
+              ("证书同步定时器启用", lambda: output(["systemctl", "is-enabled", "hy-cert-sync.timer"])),
+              ("证书同步定时器运行", lambda: output(["systemctl", "is-active", "hy-cert-sync.timer"])),
+              ("DNS / 连接地址", lambda: ", ".join(sorted({x[4][0] for x in socket.getaddrinfo(state["server"], state["port"])}))),
+              ("本机防火墙", firewall)]
     print(f"管理器 {VERSION} / 内核 {state.get('core_version', '未知')}")
-    print("服务：" + ("运行中" if service_active() else "未运行"))
-    print(f"UDP {state['port']} 监听：" + ("存在" if output(["ss", "-H", "-lun", f"sport = :{state['port']}"]) else "不存在"))
-    if state.get("cert_mode") == "selfsigned":
-        prepare_self_signed(state)
-        print("自签证书：有效期、私钥匹配、固定指纹校验通过（不依赖公共 CA）")
-    else:
-        check_certificate(state["cert_source"], state["key_source"], state["domain"])
-        print("源证书：域名、有效期、私钥匹配、系统 CA 校验通过")
-    print(output(["systemctl", "is-enabled", "hy-cert-sync.timer"]))
-    try:
-        addresses = sorted({x[4][0] for x in socket.getaddrinfo(state["server"], state["port"])})
-        print("连接地址解析：" + ", ".join(addresses))
-    except OSError as exc:
-        print(f"DNS 解析失败：{exc}")
+    for label, check in checks:
+        try:
+            result = check()
+            level = "FAIL" if result is False else ("WARN" if str(result).startswith("WARN:") else "PASS")
+            print(f"[{level}] {label}：{result}")
+        except Exception as exc:
+            print(f"[FAIL] {label}：{exc}")
     firewall_hint(state)
     print("本机诊断不能证明公网 UDP、客户端握手或实际速度；请用导出的配置连接验证。")
 
@@ -895,6 +1174,8 @@ def uninstall():
         print("已取消。")
         return
     saved = backup()
+    if firewall_prune():
+        raise ValueError("自建防火墙规则尚未清理完，已保留安装。请修复防火墙后重新运行 hy uninstall。")
     if state.get("traffic"):
         save_traffic(state, {**state["traffic"], "enabled": False})
     unpublish()
@@ -916,7 +1197,7 @@ def uninstall():
 
 def main():
     parser = argparse.ArgumentParser(description="HY：中文 Hysteria2 单节点管理工具")
-    parser.add_argument("command", nargs="?", default="menu", choices=["menu", "install", "configure", "update", "export", "publish", "unpublish", "sync-cert", "doctor", "logs", "start", "stop", "restart", "backup", "uninstall", "monitor", "limit", "unlimit", "limits", "monitor-off", "traffic-apply"])
+    parser.add_argument("command", nargs="?", default="menu", choices=["menu", "install", "configure", "update", "self-update", "status", "firewall", "enable", "disable", "export", "publish", "unpublish", "sync-cert", "doctor", "logs", "start", "stop", "restart", "backup", "uninstall", "monitor", "limit", "unlimit", "limits", "monitor-off", "traffic-apply"])
     parser.add_argument("ip", nargs="?", help="需要限速的客户端公网 IP")
     parser.add_argument("--upload", type=rate_mbps, help="客户端上传上限 Mbps，0 不限")
     parser.add_argument("--download", type=rate_mbps, help="客户端下载上限 Mbps，0 不限")
@@ -927,12 +1208,9 @@ def main():
         parser.error("IP 仅用于 limit/unlimit；速率仅用于 limit；--once 仅用于 monitor。")
     if platform.system() != "Linux" or os.geteuid() != 0 or not Path("/run/systemd/system").is_dir():
         raise ValueError("请在使用 systemd 的 Linux 服务器上以 root 运行。")
-    if not sys.stdin.isatty() and Path("/dev/tty").exists():
-        try:
-            sys.stdin = open("/dev/tty", encoding="utf-8")
-        except OSError:
-            pass
-    actions = {"install": install, "configure": configure, "update": update,
+    actions = {"install": install, "configure": configure, "update": update, "self-update": self_update,
+               "status": status, "firewall": firewall_setup, "enable": lambda: autostart(True),
+               "disable": lambda: autostart(False), "export-client": export_client,
                "export": lambda: export_files(load_state()), "publish": publish, "unpublish": unpublish,
                "sync-cert": lambda: sync_certificate(load_state()), "doctor": doctor,
                "logs": lambda: run(["journalctl", "-u", SERVICE, "-n", "60", "--no-pager"]),
@@ -956,22 +1234,33 @@ def main():
     if args.command != "menu":
         dispatch(args.command)
         return
-    options = [("安装", "install"), ("查看节点 / 导出配置", "export"), ("修改配置", "configure"),
-               ("发布 / 刷新 HTTPS 订阅", "publish"), ("撤销订阅", "unpublish"), ("诊断", "doctor"),
-               ("查看日志", "logs"), ("重启", "restart"), ("停止", "stop"),
-               ("更新官方内核", "update"), ("备份配置", "backup"), ("卸载", "uninstall"),
-               ("客户端 IP 实时流量", "monitor"), ("设置 IP 上下行限速", "limit"),
-               ("取消 IP 限速", "unlimit"), ("查看限速配置", "limits"), ("关闭监控和限速", "monitor-off")]
+    groups = [
+        ("安装与配置", [("快速 / 高级安装（已安装时刷新管理器）", "install"), ("修改节点配置", "configure"), ("设置端口放行", "firewall")]),
+        ("连接与订阅", [("按客户端导入", "export-client"), ("查看全部导出", "export"), ("发布 / 刷新 HTTPS 订阅", "publish"), ("撤销订阅", "unpublish")]),
+        ("服务管理", [("启动并开启开机启动", "start"), ("停止（不改变开机启动）", "stop"), ("重启", "restart"), ("开启开机启动", "enable"), ("关闭开机启动（不停止服务）", "disable")]),
+        ("监控与限速", [("客户端 IP 实时流量", "monitor"), ("设置 IP 上下行限速", "limit"), ("取消 IP 限速", "unlimit"), ("查看限速配置", "limits"), ("关闭监控和限速", "monitor-off")]),
+        ("更新与维护", [("更新管理脚本", "self-update"), ("更新官方内核", "update"), ("诊断", "doctor"), ("查看日志", "logs"), ("备份配置", "backup"), ("卸载", "uninstall")])]
     while True:
-        print(f"\nHY {VERSION} — Hysteria2 中文管理")
-        for i, (label, _) in enumerate(options, 1):
+        status()
+        for i, (label, _) in enumerate(groups, 1):
             print(f"{i:2}. {label}")
         selection = prompt("选择菜单，0 退出", "0")
         if selection == "0":
             return
-        if selection.isdigit() and 1 <= int(selection) <= len(options):
+        if selection.isdigit() and 1 <= int(selection) <= len(groups):
+            options = groups[int(selection) - 1][1]
+            for i, (label, _) in enumerate(options, 1):
+                print(f"{i:2}. {label}")
+            selection = prompt("选择操作，0 返回", "0")
+            if selection == "0":
+                continue
+            if not selection.isdigit() or not 1 <= int(selection) <= len(options):
+                print("无效选项。")
+                continue
             try:
                 dispatch(options[int(selection) - 1][1])
+                if options[int(selection) - 1][1] == "self-update":
+                    return
             except Exception as exc:
                 print(f"操作失败：{exc}", file=sys.stderr)
         else:

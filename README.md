@@ -6,17 +6,23 @@
 
 ## 安装
 
-以 root 执行固定版本的安装器：
+以 root 执行一键安装入口（入口内部固定发布版本并校验管理器 SHA-256）：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/demonyxp/hy/v0.3.0/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/demonyxp/hy/main/install.sh)
 ```
 
-先选择安装模式：
+默认选择 **快速安装**：自动识别公网 IP、选择空闲 UDP 端口、生成密码和自签证书。选择自动或手动放行本机防火墙，核对摘要并输入 `y` 后部署。确认前可取消，改选高级安装填写其他连接地址。
+
+公网 IP 识别通过 HTTPS 查询 ipify / ifconfig.co，IPv4 优先，失败尝试 IPv6；总查询时间最多约 20 秒。失败后手动输入。默认端口为 `24443`，冲突时检查至 `24453`，均占用则手动指定。自动识别结果是公网出口地址；NAT、多 IP 服务器应核对地址和 UDP 转发。
+
+需要固定版本时，把命令中的 `main` 换成 `v0.4.0`。首次安装和交互菜单需要终端；SSH 远程执行请使用 `ssh -t`。不会把管道输入或无人值守环境当作确认。
+
+**高级安装**保留以下两种模式，可修改端口、密码、名称和混淆；输入错误会在当前步骤重试：
 
 ### 模式 2：只有 IP，没有域名和证书
 
-输入 `2`，填写服务器公网 IPv4 或 IPv6，其他选项按需要填写或回车使用默认值。无需宝塔、网站、DNS 解析，也无需填写证书路径。
+高级安装内输入 `2`，填写服务器公网 IPv4 或 IPv6，其他选项按需要填写或回车使用默认值。快速安装直接采用此模式。无需宝塔、网站、DNS 解析，也无需填写证书路径。
 
 工具自动生成有效期 10 年的独立自签证书，私钥保存在 `/etc/hy/selfsigned/`。客户端连接到输入的 IP；`hy.invalid` 只是自动填充的 TLS 校验名称，不需要购买或解析这个域名。
 
@@ -35,7 +41,7 @@ Mihomo、sing-box 和官方内核已测试错误证书/指纹会拒绝连接。�
 
 ### 模式 1：已有域名和可信证书
 
-先通过宝塔或其他 ACME 工具申请证书；域名应直接解析到服务器，节点域名不要开启普通 CDN 代理。选择 `1`，按提示输入：
+先通过宝塔或其他 ACME 工具申请证书；域名应直接解析到服务器，节点域名不要开启普通 CDN 代理。在高级安装内选择 `1`，按提示输入：
 
 1. **证书域名**：例如 `vpn.example.com`。
 2. **连接地址**：默认与域名相同，也可以填写服务器公网 IP；SNI 仍使用证书域名。
@@ -46,7 +52,27 @@ Mihomo、sing-box 和官方内核已测试错误证书/指纹会拒绝连接。�
 
 域名模式检查证书链、域名、有效期和私钥匹配。两种模式均检查 UDP 端口占用，下载官方稳定版并校验 GitHub 提供的 SHA-256。它使用独立的 `hy-server.service` 和 `/etc/hy`，不覆盖 s-hy2 的 `/etc/hysteria` 或 3x-ui。
 
-已有旧版用户重复执行上述安装命令即可更新管理器，保留原配置。需要切换模式时运行 `hy configure`；切换后重新导入配置或更新订阅。
+### 旧版升级
+
+v0.1 / v0.2 / v0.3 用户重复执行上述一键安装命令即可升级管理器，保留密码、端口、证书指纹、订阅、限速以及服务运行和开机启动状态。不会重新安装节点或自动更新内核。
+
+从 v0.4 起也可执行：
+
+```bash
+hy self-update  # 更新管理脚本，校验版本与 SHA-256，不重启 VPN
+hy update       # 单独更新官方内核；正在运行的 VPN 会短暂重启
+```
+
+管理器更新校验失败保留旧版本，成功替换前保存旧脚本和配置备份；更新后重新运行 `hy`。发布信息和校验摘要通过 GitHub HTTPS 获取，用于检测内容错误，不是独立签名。需要切换部署模式时运行 `hy configure`；切换后重新导入配置或更新订阅。
+
+### 端口放行
+
+安装时提供自动和手动两种选项，之后可通过 `hy firewall` 调整：
+
+- 自动：只处理唯一已启用的 UFW 或 firewalld。firewalld 需只有一个活跃区域，同时处理运行和永久规则，不全量 reload；其他情形给出手动提示。
+- 手动：自行在本机防火墙和云安全组放行 UDP。不会自动安装或启用 UFW/firewalld，也不会尝试接管未知 nftables/宝塔规则。
+- 已有放行规则会复用；新增规则记录在 `/var/lib/hy/firewall.json`。修改端口成功后清理旧端口自建规则，失败时回滚新增规则，卸载只清理有记录的自建规则。清理失败会保留记录供重试；不要手动删除该文件。
+- 云厂商安全组始终需要自行放行；自动模式成功也不证明公网可达。UFW 的自建规则带唯一注释；firewalld 按区域、端口及运行/永久状态跟踪，避免同时用其他工具接管这些规则。
 
 在云安全组、宝塔防火墙放行 **UDP 24443**（或你选择的端口）。如果系统用 UFW：
 
@@ -116,18 +142,22 @@ hy unpublish
 
 ## 中文菜单与命令
 
-直接运行 `hy` 打开菜单。
+直接运行 `hy` 打开中文分组菜单，顶部显示版本、服务状态、开机启动状态、部署模式和连接地址。选择“连接与订阅 → 按客户端导入”获取对应链接或文件。
 
 | 命令 | 功能 |
 | --- | --- |
 | `hy install` | 首次安装；已安装时只刷新管理脚本 |
 | `hy configure` | 修改域名、连接地址、端口、密码、证书、混淆；自动备份，启动失败恢复旧配置 |
 | `hy update` | 更新官方内核，校验 SHA-256；运行中的服务更新失败则恢复旧内核 |
+| `hy self-update` | 更新管理脚本，保留节点配置及服务状态 |
+| `hy status` | 查看运行状态和连接信息，不显示密码 |
+| `hy firewall` | 自动 / 手动放行选项，清理过期自建规则 |
 | `hy export` | 显示节点并重新生成本地客户端文件 |
 | `hy publish` / `hy unpublish` | 发布、刷新或撤销 HTTPS 订阅 |
-| `hy doctor` | 检查服务、UDP 监听、DNS、证书和同步定时器 |
+| `hy doctor` | 只读逐项检查服务、UDP 监听、DNS、证书、同步定时器与本机防火墙；失败继续检查 |
 | `hy logs` | 查看最近 60 行服务日志 |
-| `hy start` / `hy stop` / `hy restart` | 服务控制 |
+| `hy start` / `hy stop` / `hy restart` | 启动并开启开机启动 / 停止 / 重启；停止不改变开机启动 |
+| `hy enable` / `hy disable` | 开启 / 关闭 VPN 开机启动，不改变当前运行状态 |
 | `hy sync-cert` | 立即同步源证书 |
 | `hy backup` | 备份配置、证书和发布信息 |
 | `hy uninstall` | 确认后卸载本工具，保留备份 |
@@ -137,7 +167,7 @@ hy unpublish
 此功能只针对本工具配置的 **HY2 UDP 端口**，不会按 IP 限制整个服务器。IPv4 / IPv6 都支持，不新增网页面板或外部监听端口。安装器会安装 nftables 命令，但只有执行 `hy monitor` 或 `hy limit` 才启用规则。
 
 ```bash
-# 实时显示各客户端公网 IP 的上传/下载 Mbps、累计 MiB 和限速配置
+# 实时显示各客户端公网 IP 的上传/下载 Mbps、MB/s、累计 MiB 和限速配置
 hy monitor
 
 # 采样 2 秒，打印一次后退出
@@ -194,7 +224,7 @@ journalctl -u hy-cert-sync.service -n 30 --no-pager
 
 ## 项目范围与测试
 
-这是单节点部署工具，不提供网页面板、多用户计费、流量套餐、自动放行端口、自动卸载其他 VPN 或自动接管宝塔。客户端 IP 监控/限速仅在主动启用时写入自己的 nftables 表。
+这是单节点部署工具，不提供网页面板、多用户计费、流量套餐、自动申请域名证书、自动卸载其他 VPN 或自动接管宝塔。端口自动放行仅针对上文列出的防火墙；客户端 IP 监控/限速仅在主动启用时写入自己的 nftables 表。
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -208,17 +238,27 @@ shellcheck install.sh
 docker build -f tests/Dockerfile -t hy-test .
 docker run -d --name hy-test --privileged --cgroupns=private \
   --tmpfs /run --tmpfs /run/lock -e HY_DISPOSABLE_TEST=1 hy-test
+docker exec hy-test systemctl disable --now firewalld
 docker exec hy-test python3 -u tests/live_systemd.py
 docker exec hy-test python3 -u tests/live_traffic.py
+docker exec hy-test python3 -u tests/live_cli.py
+docker exec hy-test python3 -u tests/live_bootstrap.py
+docker exec hy-test python3 -u tests/live_firewall.py
 docker rm -f hy-test
 ```
 
 集成测试覆盖实际安装、低权限服务、HY2 握手、Salamander、错误配置回滚、失败升级回滚、订阅发布/撤销、卸载和重装。可将官方 Linux 客户端二进制放入容器的 `/opt/test-clients/sing-box` 与 `/opt/test-clients/mihomo`，额外验证完整导出配置并进行真实代理请求；未提供时明确跳过。测试 HTTP 目标在容器内，因此握手测试会单独移除客户端的局域网直连规则，避免误测成直连。
+
+测试镜像包含 UFW/firewalld；运行连接测试前在容器中执行 `systemctl disable --now firewalld`，避免发行版默认区域影响测试。`live_firewall.py` 会在可丢弃容器中启停防火墙并创建测试规则，严禁在生产运行。
+
+要复现历史版本升级测试，先从本仓库 `v0.1.0`、`v0.2.0`、`v0.3.0` 标签分别提取 `hy.py`，放到容器的 `/opt/test-legacy/v0.1.0.py`、`v0.2.0.py`、`v0.3.0.py`，再运行 `live_systemd.py`。未提供这些文件时明确跳过此部分。
 
 v0.1.0 已在 Ubuntu 24.04 amd64 / Hysteria2 2.13.0 验证，客户端内核验证为 Mihomo 1.19.32 和 sing-box 1.14.3，包含开启/关闭混淆的真实代理请求。未对每个图形客户端逐一执行界面导入测试；其他支持平台仍需在实际服务器验证。
 
 v0.2.0 在上述环境补充通过纯 IP 自动自签安装、三种客户端内核连接、混淆开关、错误指纹/证书拒绝、证书保持不变和切回原有证书模式测试。10 项单元测试在 Linux 全部通过。
 
 v0.3.0 的 15 项 Linux 单元测试通过，真实内核测试覆盖 HY2 计数、IPv4/IPv6 上下行限速、取消限速、端口迁移、规则原子更新失败、开机配置恢复、监控与修改并发、卸载清理，以及其他 IP/端口/TCP/防火墙表不受影响。
+
+v0.4.0 在 Ubuntu 24.04 amd64 隔离容器通过 30 项单元测试、ShellCheck，以及快速自签安装、官方/Mihomo/sing-box 真实连接、错误证书拒绝、终端菜单、非交互输入保护、安装入口 SHA-256/版本/语法检查、真实 UFW/firewalld 规则生命周期测试。实际安装 v0.1/v0.2/v0.3 后升级，验证配置、证书身份、订阅文件、服务 PID 和开机启动状态不变；保留原有 IPv4/IPv6 流量限速回归。其他架构和发行版尚未逐一实机验证。
 
 参考：[Hysteria2 官方](https://github.com/HyNetworks/hysteria)、[服务端配置](https://v2.hysteria.network/zh/docs/advanced/Full-Server-Config/)、[节点 URI](https://v2.hysteria.network/docs/developers/URI-Scheme/)、[Mihomo Hysteria2 配置](https://wiki.metacubex.one/config/proxies/hysteria2/)、[sing-box Hysteria2 配置](https://sing-box.sagernet.org/configuration/outbound/hysteria2/)。
