@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""面向 Debian / Ubuntu 的 Hysteria2 单节点管理器。"""
+"""面向 Debian / Ubuntu / Amazon Linux 2023 的 Hysteria2 单节点管理器。"""
 
 import argparse
 import base64
@@ -25,7 +25,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 MANAGER_URL = "https://raw.githubusercontent.com/demonyxp/hy"
 REPO = "HyNetworks/hysteria"
 ETC = Path("/etc/hy")
@@ -137,7 +137,7 @@ def check_certificate(cert, key, hostname, self_signed=False):
         raise ValueError("证书与私钥不匹配。")
     # 域名模式使用系统 CA；自签模式只信任本工具生成的证书。
     run(["openssl", "verify", "-purpose", "sslserver", "-verify_hostname", hostname,
-         *(["-CAfile", cert] if self_signed else ["-CApath", "/etc/ssl/certs"]),
+         *(["-CAfile", cert] if self_signed else []),
          "-untrusted", cert, cert],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
@@ -793,13 +793,24 @@ def rate_mbps(value):
 
 def nft_table():
     if not shutil.which("nft"):
-        raise ValueError("需要 nftables，请先执行 apt-get update && apt-get install -y nftables，或更新安装器。")
+        raise ValueError("需要 nftables：Debian/Ubuntu 执行 apt-get install -y nftables；Amazon Linux 2023 执行 dnf install -y nftables，或重新运行安装器补齐依赖。")
     tables = json.loads(output(["nft", "-j", "list", "tables"]))["nftables"]
     if not any(item.get("table", {}).get("name") == TRAFFIC_TABLE and
                item["table"].get("family") == "inet" for item in tables):
         return None
     table = json.loads(output(["nft", "-j", "list", "table", "inet", TRAFFIC_TABLE]))
-    if not any(item.get("table", {}).get("comment") == MARKER for item in table["nftables"]):
+    metadata = next((item["table"] for item in table["nftables"] if
+                     item.get("table", {}).get("name") == TRAFFIC_TABLE and
+                     item["table"].get("family") == "inet"), {})
+    owned = metadata.get("comment") == MARKER
+    if metadata and "comment" not in metadata:
+        # Amazon Linux 的 nft 1.0.4 不在 JSON 中返回表注释，严格检查文本表头。
+        # 只接受表级归属注释，不能把规则或链里的同名注释当作所有权证明。
+        header = output(["nft", "--terse", "list", "table", "inet", TRAFFIC_TABLE])
+        pattern = (r'\Atable inet ' + re.escape(TRAFFIC_TABLE) + r' \{\s*\n[ \t]*comment '
+                   + re.escape(json.dumps(MARKER)) + r'[ \t]*;?[ \t]*(?:\n|$)')
+        owned = re.match(pattern, header) is not None
+    if not owned:
         raise ValueError("同名 nftables 表不属于本工具，拒绝操作。")
     return table
 

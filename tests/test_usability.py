@@ -77,7 +77,7 @@ class UsabilityTests(unittest.TestCase):
                 wizard.assert_not_called()
 
     def test_self_update_rejects_bad_hash_syntax_and_downgrade(self):
-        for content, version, wrong_hash in ((b"bad", "0.4.0", True), (b"if broken", "0.4.0", False),
+        for content, version, wrong_hash in ((b"bad", hy.VERSION, True), (b"if broken", hy.VERSION, False),
                                               (b"", "0.3.0", False)):
             metadata = json.dumps({"version": version, "sha256": "a" * 64 if wrong_hash else hashlib.sha256(content).hexdigest()}).encode()
             with patch.object(hy, "load_state", return_value=fixture()), \
@@ -90,8 +90,8 @@ class UsabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "hy.py").write_text("old manager")
-            content = b'VERSION = "0.4.0"\n'
-            meta = json.dumps({"version": "0.4.0", "sha256": hashlib.sha256(content).hexdigest()}).encode()
+            content = f'VERSION = "{hy.VERSION}"\n'.encode()
+            meta = json.dumps({"version": hy.VERSION, "sha256": hashlib.sha256(content).hexdigest()}).encode()
             with patch.object(hy, "LIB", root), patch.object(hy, "load_state", return_value=fixture()), \
                  patch.object(hy, "fetch_manager", side_effect=[meta, content]), \
                  patch.object(hy, "backup", return_value=root / "backup"), patch.object(hy, "run") as run:

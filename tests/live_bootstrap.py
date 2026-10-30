@@ -1,4 +1,4 @@
-"""在已安装的隔离容器验证安装入口校验及重复执行，不访问远端发布地址。"""
+"""在隔离容器验证依赖安装、入口校验及重复执行，不访问远端发布地址。"""
 import hashlib
 import json
 import os
@@ -12,8 +12,8 @@ if os.environ.get("HY_DISPOSABLE_TEST") != "1" or not Path("/.dockerenv").exists
 source = Path(__file__).parents[1]
 state = Path("/etc/hy/state.json")
 manager = Path("/usr/local/lib/hy/hy.py")
-before = state.read_bytes()
-pid = subprocess.check_output(["systemctl", "show", "-p", "MainPID", "--value", "hy-server"])
+before = state.read_bytes() if state.exists() else None
+pid = subprocess.check_output(["systemctl", "show", "-p", "MainPID", "--value", "hy-server"]) if before else None
 with tempfile.TemporaryDirectory(prefix="hy-bootstrap-") as tmp:
     root = Path(tmp)
     binary = root / "bin"
@@ -38,11 +38,14 @@ shutil.copyfile(Path(os.environ["HY_BOOTSTRAP_SOURCE"]) / name, sys.argv[sys.arg
                                 (valid, content)):
         (root / "hy.py").write_bytes(candidate)
         (root / "release.json").write_text(json.dumps(metadata))
-        old_manager = manager.read_bytes()
-        result = subprocess.run(["bash", str(source / "install.sh")], env=env, capture_output=True, timeout=20)
+        old_manager = manager.read_bytes() if manager.exists() else None
+        # 新系统只安装依赖并检查入口，后续由真实服务测试创建节点。
+        result = subprocess.run(["bash", str(source / "install.sh"), *([] if before else ["--help"])],
+                                env=env, capture_output=True, timeout=300)
         success = metadata == valid and candidate == content
         assert (result.returncode == 0) == success, result.stderr.decode()
-        assert manager.read_bytes() == (content if success else old_manager)
-        assert state.read_bytes() == before
-        assert pid == subprocess.check_output(["systemctl", "show", "-p", "MainPID", "--value", "hy-server"])
+        assert (manager.read_bytes() if manager.exists() else None) == (content if success and before else old_manager)
+        assert (state.read_bytes() if state.exists() else None) == before
+        if before:
+            assert pid == subprocess.check_output(["systemctl", "show", "-p", "MainPID", "--value", "hy-server"])
 print("PASS: bootstrap checksum / version / syntax rejection and successful repeat install preserve config and PID")

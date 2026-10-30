@@ -1,0 +1,8 @@
+FROM amazonlinux:2023
+# 保留缺少 openssl/iproute/nftables 等工具的环境，由安装入口实际补齐依赖。
+RUN dnf install -y systemd procps-ng tar gzip && dnf clean all
+# Docker 网络由宿主管理；容器内不等待 networkd 配置 EC2 网卡。
+RUN systemctl mask systemd-networkd-wait-online.service
+COPY . /src
+WORKDIR /src
+CMD ["/sbin/init"]

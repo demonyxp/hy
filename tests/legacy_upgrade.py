@@ -54,4 +54,4 @@ def check_upgrades(hy, state, reuse_download, connect):
             assert (hy.LIB / "hy.py").read_bytes() == Path(hy.__file__).read_bytes()
         hy.start()
         connect(hy.load_state())
-        print(f"PASS: real {old.VERSION} install -> 0.4.0 / unchanged config, PID, startup / HY2 handshake")
+        print(f"PASS: real {old.VERSION} install -> {hy.VERSION} / unchanged config, PID, startup / HY2 handshake")

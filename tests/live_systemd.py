@@ -76,8 +76,12 @@ with tempfile.TemporaryDirectory(prefix="hy-live-") as tmp:
     run(["openssl", "x509", "-req", "-in", str(csr), "-CA", str(ca), "-CAkey", str(ca_key),
          "-CAcreateserial", "-out", str(cert), "-days", "3", "-extfile", str(extensions)])
     cert.write_bytes(cert.read_bytes() + ca.read_bytes())
-    shutil.copy2(ca, "/usr/local/share/ca-certificates/hy-disposable.crt")
-    run(["update-ca-certificates"])
+    if shutil.which("update-ca-certificates"):
+        shutil.copy2(ca, "/usr/local/share/ca-certificates/hy-disposable.crt")
+        run(["update-ca-certificates"])
+    else:
+        shutil.copy2(ca, "/etc/pki/ca-trust/source/anchors/hy-disposable.crt")
+        run(["update-ca-trust", "extract"])
     hy.check_certificate(cert, key, "vpn.example.test")
     state = {"owner": hy.MARKER, "domain": "vpn.example.test", "server": "127.0.0.1", "port": 24443,
              "password": "disposable-test:@/#?12345", "name": "测试节点", "obfs": "",

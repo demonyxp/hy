@@ -1,5 +1,6 @@
 """在隔离容器验证真实终端菜单及非交互输入保护；先运行 live_systemd.py。"""
 import os
+import json
 from pathlib import Path
 import pty
 import subprocess
@@ -13,7 +14,8 @@ result = subprocess.run(["hy", "configure"], input="y\n", text=True, capture_out
 assert result.returncode != 0 and "交互终端" in result.stderr
 assert state.read_bytes() == before
 result = subprocess.run(["hy", "status"], capture_output=True, text=True, check=True)
-assert all(value in result.stdout for value in ("HY 0.4.0", "开机启动", "UDP"))
+version = json.loads((Path(__file__).parents[1] / "release.json").read_text())["version"]
+assert all(value in result.stdout for value in (f"HY {version}", "开机启动", "UDP"))
 master, slave = pty.openpty()
 try:
     process = subprocess.Popen(["hy"], stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

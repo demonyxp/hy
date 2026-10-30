@@ -2,7 +2,7 @@
 
 面向单服务器的中文部署工具：支持已有域名证书，也支持无域名、无现成证书的纯 IP 安装。安装官方 Hysteria2 内核，生成节点和客户端配置，用 `hy` 管理。
 
-**支持 Ubuntu 22.04 / 24.04、Debian 12 / 13，amd64 / arm64，要求 systemd。** 纯 IP 模式自动生成自签证书；域名模式复用已有可信证书。云安全组需要另外放行所选 UDP 端口。
+**支持 Ubuntu 22.04 / 24.04、Debian 12 / 13、Amazon Linux 2023，amd64 / arm64，要求 systemd。** 纯 IP 模式自动生成自签证书；域名模式复用已有可信证书。云安全组需要另外放行所选 UDP 端口。Amazon Linux 2 暂不支持。
 
 ## 安装
 
@@ -16,7 +16,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/demonyxp/hy/main/install.sh)
 
 公网 IP 识别通过 HTTPS 查询 ipify / ifconfig.co，IPv4 优先，失败尝试 IPv6；总查询时间最多约 20 秒。失败后手动输入。默认端口为 `24443`，冲突时检查至 `24453`，均占用则手动指定。自动识别结果是公网出口地址；NAT、多 IP 服务器应核对地址和 UDP 转发。
 
-需要固定版本时，把命令中的 `main` 换成 `v0.4.0`。首次安装和交互菜单需要终端；SSH 远程执行请使用 `ssh -t`。不会把管道输入或无人值守环境当作确认。
+需要固定版本时，把命令中的 `main` 换成 `v0.4.1`。首次安装和交互菜单需要终端；SSH 远程执行请使用 `ssh -t`。不会把管道输入或无人值守环境当作确认。
+
+Amazon Linux 2023 的 `ec2-user` 用户先单独执行 `sudo -i`，看到 root 提示符后再运行安装命令。安装器自动使用 DNF 补齐依赖，不升级整个系统；沿用系统 Python 3.9 和已经可用的 curl/curl-minimal。域名证书使用 OpenSSL 的系统默认 CA 信任库验证。与 sing-box 共存时使用不同的监听端口，安装器不会停止或覆盖 sing-box；在 AWS 安全组另行放行选定的 UDP 端口。
 
 **高级安装**保留以下两种模式，可修改端口、密码、名称和混淆；输入错误会在当前步骤重试：
 
@@ -54,7 +56,7 @@ Mihomo、sing-box 和官方内核已测试错误证书/指纹会拒绝连接。�
 
 ### 旧版升级
 
-v0.1 / v0.2 / v0.3 用户重复执行上述一键安装命令即可升级管理器，保留密码、端口、证书指纹、订阅、限速以及服务运行和开机启动状态。不会重新安装节点或自动更新内核。
+v0.1 / v0.2 / v0.3 / v0.4.0 用户重复执行上述一键安装命令即可升级管理器，保留密码、端口、证书指纹、订阅、限速以及服务运行和开机启动状态。不会重新安装节点或自动更新内核。
 
 从 v0.4 起也可执行：
 
@@ -253,6 +255,8 @@ docker rm -f hy-test
 
 要复现历史版本升级测试，先从本仓库 `v0.1.0`、`v0.2.0`、`v0.3.0` 标签分别提取 `hy.py`，放到容器的 `/opt/test-legacy/v0.1.0.py`、`v0.2.0.py`、`v0.3.0.py`，再运行 `live_systemd.py`。未提供这些文件时明确跳过此部分。
 
+Amazon Linux 2023 使用 `tests/Dockerfile.amazonlinux` 构建镜像，以相同的 systemd 容器参数启动。先运行 `tests/live_bootstrap.py` 验证 DNF 实际补齐缺失依赖及入口校验，再运行单元测试、`live_systemd.py`、`live_cli.py` 和 `live_traffic.py`。测试会向容器的系统信任库安装一次性测试 CA，不可在生产运行。
+
 v0.1.0 已在 Ubuntu 24.04 amd64 / Hysteria2 2.13.0 验证，客户端内核验证为 Mihomo 1.19.32 和 sing-box 1.14.3，包含开启/关闭混淆的真实代理请求。未对每个图形客户端逐一执行界面导入测试；其他支持平台仍需在实际服务器验证。
 
 v0.2.0 在上述环境补充通过纯 IP 自动自签安装、三种客户端内核连接、混淆开关、错误指纹/证书拒绝、证书保持不变和切回原有证书模式测试。10 项单元测试在 Linux 全部通过。
@@ -260,5 +264,9 @@ v0.2.0 在上述环境补充通过纯 IP 自动自签安装、三种客户端内
 v0.3.0 的 15 项 Linux 单元测试通过，真实内核测试覆盖 HY2 计数、IPv4/IPv6 上下行限速、取消限速、端口迁移、规则原子更新失败、开机配置恢复、监控与修改并发、卸载清理，以及其他 IP/端口/TCP/防火墙表不受影响。
 
 v0.4.0 在 Ubuntu 24.04 amd64 隔离容器通过 30 项单元测试、ShellCheck，以及快速自签安装、官方/Mihomo/sing-box 真实连接、错误证书拒绝、终端菜单、非交互输入保护、安装入口 SHA-256/版本/语法检查、真实 UFW/firewalld 规则生命周期测试。实际安装 v0.1/v0.2/v0.3 后升级，验证配置、证书身份、订阅文件、服务 PID 和开机启动状态不变；保留原有 IPv4/IPv6 流量限速回归。其他架构和发行版尚未逐一实机验证。
+
+v0.4.1 增加 Amazon Linux 2023 支持：适配 DNF 包名、系统默认 CA 信任库和 nftables 1.0.4 不输出 JSON 表注释的行为；仍严格验证表级归属，不接管其他防火墙表。CI 同时检查 Python 3.9 和 3.12。
+
+该版本在 Amazon Linux 2023 amd64 / Python 3.9 / nftables 1.0.4 隔离容器验证 DNF 依赖安装、31 项单元测试、域名和纯 IP 安装、官方/Mihomo/sing-box 真实连接、IPv4/IPv6 监控限速、CLI 和重复安装校验；已有 sing-box 服务的 PID、服务文件和配置保持不变。Ubuntu 24.04 回归通过单元测试、ShellCheck 和真实 HY2 安装连接；未直接操作或验证用户的 EC2 实例。
 
 参考：[Hysteria2 官方](https://github.com/HyNetworks/hysteria)、[服务端配置](https://v2.hysteria.network/zh/docs/advanced/Full-Server-Config/)、[节点 URI](https://v2.hysteria.network/docs/developers/URI-Scheme/)、[Mihomo Hysteria2 配置](https://wiki.metacubex.one/config/proxies/hysteria2/)、[sing-box Hysteria2 配置](https://sing-box.sagernet.org/configuration/outbound/hysteria2/)。

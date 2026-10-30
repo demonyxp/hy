@@ -51,9 +51,27 @@ class TrafficTests(unittest.TestCase):
     def test_foreign_table_is_never_adopted(self):
         tables = {"nftables": [{"table": {"family": "inet", "name": hy.TRAFFIC_TABLE}}]}
         with patch.object(hy.shutil, "which", return_value="/usr/sbin/nft"), \
-             patch.object(hy, "output", side_effect=[json.dumps(tables), json.dumps(tables)]):
+             patch.object(hy, "output", side_effect=[json.dumps(tables), json.dumps(tables),
+                                                      'table inet hy_traffic {\n\tcomment "foreign"\n}']):
             with self.assertRaises(ValueError):
                 hy.nft_table()
+
+    def test_old_nft_json_requires_exact_table_level_owner(self):
+        tables = {"nftables": [{"table": {"family": "inet", "name": hy.TRAFFIC_TABLE}}]}
+        cases = [
+            ('table inet hy_traffic {\n\tcomment "demonyxp/hy"\n\tchain incoming { }\n}', True),
+            ('table inet hy_traffic {\n\tcomment "foreign"\n}', False),
+            ('table inet hy_traffic {\n\tchain incoming {\n\t\tcomment "demonyxp/hy"\n}\n}', False),
+            ('table inet another_table {\n\tcomment "demonyxp/hy"\n}', False),
+        ]
+        for header, owned in cases:
+            with self.subTest(header=header), patch.object(hy.shutil, "which", return_value="/usr/sbin/nft"), \
+                 patch.object(hy, "output", side_effect=[json.dumps(tables), json.dumps(tables), header]):
+                if owned:
+                    self.assertEqual(hy.nft_table(), tables)
+                else:
+                    with self.assertRaises(ValueError):
+                        hy.nft_table()
 
     def test_editing_one_direction_preserves_other_limit(self):
         state = {"traffic": {"enabled": True, "limits": {"203.0.113.7": {"upload": "10", "download": "20"}}}}
