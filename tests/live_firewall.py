@@ -27,6 +27,11 @@ with tempfile.TemporaryDirectory(prefix="hy-firewall-") as tmp, patch.object(hy,
         first = hy.firewall_records()
         hy.firewall_apply(state)
         assert first == hy.firewall_records() and len(first) == 1
+        hy.firewall_apply(state, protocol="tcp")
+        assert len(hy.firewall_records()) == 2
+        hy.firewall_prune(protocol="tcp")
+        assert hy.firewall_records() == first
+        assert "24443/udp" in hy.output(["ufw", "show", "added"])
         hy.firewall_apply({**state, "port": 24444})
         assert hy.firewall_records() == first
         hy.firewall_prune(24444)
@@ -47,6 +52,13 @@ with tempfile.TemporaryDirectory(prefix="hy-firewall-") as tmp, patch.object(hy,
         hy.firewall_apply(state)
         hy.firewall_apply({**state, "port": 24444})
         assert hy.firewall_records() == records
+        hy.firewall_apply(state, protocol="tcp")
+        assert len(hy.firewall_records()) == 4
+        hy.firewall_prune(protocol="tcp")
+        assert hy.firewall_records() == records
+        for flag in ([], ["--permanent"]):
+            ports = hy.output(["firewall-cmd", "--zone=public", *flag, "--list-ports"])
+            assert "24443/tcp" not in ports and "24443/udp" in ports
         hy.firewall_prune(24444)
         for flag in ([], ["--permanent"]):
             ports = hy.output(["firewall-cmd", "--zone=public", *flag, "--list-ports"])

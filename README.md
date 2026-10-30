@@ -16,7 +16,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/demonyxp/hy/main/install.sh)
 
 公网 IP 识别通过 HTTPS 查询 ipify / ifconfig.co，IPv4 优先，失败尝试 IPv6；总查询时间最多约 20 秒。失败后手动输入。默认端口为 `24443`，冲突时检查至 `24453`，均占用则手动指定。自动识别结果是公网出口地址；NAT、多 IP 服务器应核对地址和 UDP 转发。
 
-需要固定版本时，把命令中的 `main` 换成 `v0.4.1`。首次安装和交互菜单需要终端；SSH 远程执行请使用 `ssh -t`。不会把管道输入或无人值守环境当作确认。
+需要固定版本时，把命令中的 `main` 换成 `v0.5.0`。首次安装和交互菜单需要终端；SSH 远程执行请使用 `ssh -t`。不会把管道输入或无人值守环境当作确认。
 
 Amazon Linux 2023 的 `ec2-user` 用户先单独执行 `sudo -i`，看到 root 提示符后再运行安装命令。安装器自动使用 DNF 补齐依赖，不升级整个系统；沿用系统 Python 3.9 和已经可用的 curl/curl-minimal。域名证书使用 OpenSSL 的系统默认 CA 信任库验证。与 sing-box 共存时使用不同的监听端口，安装器不会停止或覆盖 sing-box；在 AWS 安全组另行放行选定的 UDP 端口。
 
@@ -56,7 +56,9 @@ Mihomo、sing-box 和官方内核已测试错误证书/指纹会拒绝连接。�
 
 ### 旧版升级
 
-v0.1 / v0.2 / v0.3 / v0.4.0 用户重复执行上述一键安装命令即可升级管理器，保留密码、端口、证书指纹、订阅、限速以及服务运行和开机启动状态。不会重新安装节点或自动更新内核。
+v0.1 / v0.2 / v0.3 / v0.4.x 用户重复执行上述一键安装命令即可升级管理器，保留密码、端口、证书指纹、订阅、限速以及服务运行和开机启动状态。不会重新安装节点或自动更新内核。
+
+v0.5.0 已移除管理操作锁。即使旧版进程因 Ctrl+Z 暂停而占锁，直接运行安装入口也可升级，无需删除锁文件。升级完成后退出旧菜单，重新运行 `hy`。不再阻止多个终端操作，但请避免同时修改同一配置，以免后一次保存覆盖前一次更改。
 
 从 v0.4 起也可执行：
 
@@ -112,15 +114,42 @@ hy export
 
 sing-box 配置使用系统 DNS，局域网直连、其余代理，不依赖外部规则数据库；它提供本地代理端口，不自动启用 TUN。Hiddify 优先使用 `hiddify.txt` 订阅，让应用管理 TUN 和分流。
 
-## HTTPS 订阅：使用已有网站
+## 在线订阅：IP 直连或已有 HTTPS 网站
 
-这是可选功能，纯 IP 安装无需执行。如果另有可信 HTTPS 网站，也可以在纯 IP 模式运行此命令并填写网站信息；本工具不启动 HTTP 明文订阅服务。
+运行下面命令，或在菜单选择“连接与订阅 → 发布 / 刷新 IP 或 HTTPS 订阅”：
 
 ```bash
 hy publish
 ```
 
-输入已有站点根目录，例如 `/www/wwwroot/vpn.example.com`，以及 `https://vpn.example.com`。工具只在站点内创建一个随机目录：
+### 方式 1：直接使用 IP，不需要域名或证书
+
+选择 `1`，确认服务器 IP 和订阅 TCP 端口（默认 `24444`），会自动启动独立的 `hy-subscription.service` 并生成链接，例如：
+
+```text
+http://203.0.113.10:24444/hy-sub-<随机令牌>/hiddify.txt
+http://203.0.113.10:24444/hy-sub-<随机令牌>/v2rayn.txt
+http://203.0.113.10:24444/hy-sub-<随机令牌>/clash.yaml
+http://203.0.113.10:24444/hy-sub-<随机令牌>/flclash.yaml
+http://203.0.113.10:24444/hy-sub-<随机令牌>/sing-box.json
+```
+
+IPv6 地址自动加方括号。该服务只返回随机路径下的这些订阅文件，不开放目录浏览或其他配置文件，使用低权限账户、连接超时和并发上限，不记录含密钥的访问路径。它是供个人使用的轻量订阅端点，不承担通用网站托管。
+
+**HTTP 订阅内容包含节点密码，传输不加密；随机链接本身就是访问凭据，请勿分享。** 这只影响订阅获取方式，HY2 数据连接仍使用原来的 TLS/证书配置。若客户端要求 HTTPS，请选择方式 2；不同客户端的 HTTP 导入限制以实际版本为准。
+
+在云安全组放行 **TCP 24444**（或选择的端口）；VPN 本身仍需要 **UDP 24443**（或原节点端口）。如果安装时选择自动放行，订阅也会尝试处理已启用的 UFW/firewalld；手动模式自行放行。TCP 规则独立记录，撤销订阅只清理脚本自建的订阅 TCP 规则，不清理 VPN 的 UDP 规则。
+
+```bash
+systemctl status hy-subscription --no-pager
+journalctl -u hy-subscription -n 30 --no-pager
+```
+
+修改节点配置后会刷新订阅内容，链接保持不变。升级管理脚本后可运行 `hy publish` 重新加载已发布的 IP 订阅服务。`hy stop` 只停止 VPN；要关闭 IP 订阅使用 `hy unpublish`。
+
+### 方式 2：使用已有 HTTPS 网站
+
+选择 `2`，输入已有站点根目录，例如 `/www/wwwroot/vpn.example.com`，以及 `https://vpn.example.com`。工具只在站点内创建一个随机目录：
 
 ```text
 https://vpn.example.com/hy-sub-<随机令牌>/hiddify.txt
@@ -130,7 +159,7 @@ https://vpn.example.com/hy-sub-<随机令牌>/flclash.yaml
 https://vpn.example.com/hy-sub-<随机令牌>/sing-box.json
 ```
 
-复制对应订阅到客户端即可。**没有额外的 2096 端口或订阅进程，不修改 Nginx 配置、网站根目录或 SSL 配置。** 站点必须允许访问这些静态文件；如果网站把所有路径反代到应用，需自行配置静态访问。工具会尝试通过 HTTPS 下载并逐字核对内容，失败时明确显示未验证，不会把“文件已生成”当成“订阅已可用”。本机通过也不保证所有外网线路均可达。
+复制对应订阅到客户端即可。**此方式没有额外的订阅端口或订阅进程，不修改 Nginx 配置、网站根目录或 SSL 配置。** 站点必须允许访问这些静态文件；如果网站把所有路径反代到应用，需自行配置静态访问。工具会尝试通过 HTTPS 下载并逐字核对内容，失败时明确显示未验证，不会把“文件已生成”当成“订阅已可用”。本机通过也不保证所有外网线路均可达。
 
 订阅链接含访问凭据，随机路径相当于密码，请勿公开。不要把节点文件或配置备份提交到 GitHub；发布前确认站点不会对这些文件做公开缓存。重新执行 `hy publish` 会刷新原有链接。
 
@@ -141,6 +170,8 @@ hy unpublish
 ```
 
 撤销订阅不等于撤销已经导入的节点。需要撤销节点访问时，执行 `hy configure` 修改密码，再重新导入配置。
+
+已有订阅默认刷新原方式和原链接。切换 HTTP/HTTPS、修改订阅地址或端口时，先 `hy unpublish` 再 `hy publish`，会生成新的随机链接。
 
 ## 中文菜单与命令
 
@@ -155,7 +186,7 @@ hy unpublish
 | `hy status` | 查看运行状态和连接信息，不显示密码 |
 | `hy firewall` | 自动 / 手动放行选项，清理过期自建规则 |
 | `hy export` | 显示节点并重新生成本地客户端文件 |
-| `hy publish` / `hy unpublish` | 发布、刷新或撤销 HTTPS 订阅 |
+| `hy publish` / `hy unpublish` | 发布、刷新或撤销 IP HTTP / 已有网站 HTTPS 订阅 |
 | `hy doctor` | 只读逐项检查服务、UDP 监听、DNS、证书、同步定时器与本机防火墙；失败继续检查 |
 | `hy logs` | 查看最近 60 行服务日志 |
 | `hy start` / `hy stop` / `hy restart` | 启动并开启开机启动 / 停止 / 重启；停止不改变开机启动 |
@@ -220,7 +251,7 @@ journalctl -u hy-cert-sync.service -n 30 --no-pager
 - `hy update` 替换前备份旧内核；重启失败则恢复。
 - 备份位于 `/var/lib/hy/backups/`，包含密码和私钥，仅 root 可访问；按需要自行清理旧备份。
 - 卸载只清理本工具专用路径与带归属标记的订阅文件，保留备份、专用系统账户和运行目录；可再次安装复用。
-- 同一时间只允许一个配置修改操作；监控显示和菜单等待不占写锁，可在另一终端调整限速。
+- 管理操作不加互斥锁；暂停的菜单不会阻止其他管理命令。配置文件仍原子写入，但不要同时在多个终端修改同一配置。
 
 **服务运行、TCP 可达、服务器下载快都不能证明客户端 HY2 可用。** 最后必须用导出的客户端配置测试真实 UDP 握手、访问网站和出口 IP。若超时，先检查 UDP 安全组、系统防火墙、CDN、DNS 和运营商线路。
 
@@ -245,6 +276,7 @@ docker exec hy-test python3 -u tests/live_systemd.py
 docker exec hy-test python3 -u tests/live_traffic.py
 docker exec hy-test python3 -u tests/live_cli.py
 docker exec hy-test python3 -u tests/live_bootstrap.py
+docker exec hy-test python3 -u tests/live_subscription.py
 docker exec hy-test python3 -u tests/live_firewall.py
 docker rm -f hy-test
 ```
@@ -268,5 +300,7 @@ v0.4.0 在 Ubuntu 24.04 amd64 隔离容器通过 30 项单元测试、ShellCheck
 v0.4.1 增加 Amazon Linux 2023 支持：适配 DNF 包名、系统默认 CA 信任库和 nftables 1.0.4 不输出 JSON 表注释的行为；仍严格验证表级归属，不接管其他防火墙表。CI 同时检查 Python 3.9 和 3.12。
 
 该版本在 Amazon Linux 2023 amd64 / Python 3.9 / nftables 1.0.4 隔离容器验证 DNF 依赖安装、31 项单元测试、域名和纯 IP 安装、官方/Mihomo/sing-box 真实连接、IPv4/IPv6 监控限速、CLI 和重复安装校验；已有 sing-box 服务的 PID、服务文件和配置保持不变。Ubuntu 24.04 回归通过单元测试、ShellCheck 和真实 HY2 安装连接；未直接操作或验证用户的 EC2 实例。
+
+v0.5.0 移除管理锁，并增加 IP HTTP 订阅。在 Ubuntu 24.04 与 Amazon Linux 2023 隔离环境通过 40 项单元测试及实际 systemd 订阅服务测试：覆盖旧版暂停进程持锁时的升级/管理操作、五种订阅格式、IPv6 HTTP、错误令牌和目录访问拒绝、动态刷新、失败回滚、撤销及卸载。UFW/firewalld 实测验证 TCP 订阅规则清理不会影响 UDP 节点规则。未逐一验证各图形客户端的 HTTP URL 导入界面。
 
 参考：[Hysteria2 官方](https://github.com/HyNetworks/hysteria)、[服务端配置](https://v2.hysteria.network/zh/docs/advanced/Full-Server-Config/)、[节点 URI](https://v2.hysteria.network/docs/developers/URI-Scheme/)、[Mihomo Hysteria2 配置](https://wiki.metacubex.one/config/proxies/hysteria2/)、[sing-box Hysteria2 配置](https://sing-box.sagernet.org/configuration/outbound/hysteria2/)。

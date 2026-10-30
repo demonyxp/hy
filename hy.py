@@ -3,11 +3,11 @@
 
 import argparse
 import base64
-from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 import datetime as dt
 import getpass
 import hashlib
+import http.server
 import ipaddress
 import json
 import os
@@ -21,11 +21,12 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 MANAGER_URL = "https://raw.githubusercontent.com/demonyxp/hy"
 REPO = "HyNetworks/hysteria"
 ETC = Path("/etc/hy")
@@ -39,6 +40,11 @@ USER = "hyproxy"
 MARKER = "demonyxp/hy"
 TRAFFIC_TABLE = "hy_traffic"
 TRAFFIC_SERVICE = "hy-traffic.service"
+SUB_SERVICE = "hy-subscription.service"
+
+
+def subscription_config_path():
+    return ETC / "subscription.json"
 
 
 def run(args, **kwargs):
@@ -357,8 +363,8 @@ def export_client():
         print(f"下载后在客户端导入配置文件：{DATA / 'export' / name}")
     if selected != "5" and state.get("publication"):
         name = {"1": "hiddify.txt", "2": "v2rayn.txt", "3": "clash.yaml", "4": "sing-box.json"}[selected]
-        print(f"已有订阅：{state['publication']['url']}/hy-sub-{state['publication']['token']}/{name}")
-    print("凭据只交给使用者；需要 HTTPS 订阅请在连接与订阅菜单中发布。")
+        print(f"已有订阅：{subscription_url(state['publication'], name)}")
+    print("凭据只交给使用者；需要 IP / HTTPS 订阅请在连接与订阅菜单中发布。")
 
 
 def release_asset(release, arch):
@@ -493,6 +499,29 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 [Install]
 WantedBy=multi-user.target
+""", SUB_SERVICE: f"""# {MARKER}
+[Unit]
+Description=HY IP subscription server
+After=network.target
+[Service]
+User={USER}
+Group={USER}
+ExecStart=/usr/local/bin/hy serve-subscription
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+TasksMax=48
+MemoryMax=128M
+[Install]
+WantedBy=multi-user.target
 """, "hy-cert-sync.service": f"""# {MARKER}
 [Unit]
 Description=HY certificate synchronization
@@ -546,6 +575,8 @@ def restore_config(target):
     gid = group_id()
     os.chown(ETC, 0, gid)
     os.chown(ETC / "server.json", 0, gid)
+    if subscription_config_path().exists():
+        os.chown(subscription_config_path(), 0, gid)
     for path in (ETC / "tls", *(ETC / "tls").rglob("*")):
         if not path.is_symlink():
             os.chown(path, 0, gid)
@@ -607,9 +638,9 @@ def install():
     firewall_hint(state)
     print("\n安装完成。输入 hy 打开中文菜单。服务启动成功不代表公网 UDP 已放行。")
     if state.get("cert_mode") == "selfsigned":
-        print("纯 IP 模式可直接导入节点链接/本地配置，无需网站。已有 HTTPS 网站时可另运行 hy publish。")
+        print("纯 IP 模式可直接导入节点链接/本地配置；运行 hy publish 可创建 IP 订阅，无需网站。")
     else:
-        print("需要在线订阅时运行 hy publish，复用已有 HTTPS 网站。")
+        print("需要在线订阅时运行 hy publish，可选择 IP 订阅或已有 HTTPS 网站。")
 
 
 def configure():
@@ -719,8 +750,176 @@ def publication_dir(publication):
     return target
 
 
+def http_publication(address, port, token=None):
+    address, port = ip_literal(address), port_number(port)
+    token = token or secrets.token_hex(24)
+    if not re.fullmatch(r"[a-f0-9]{48}", token):
+        raise ValueError("订阅令牌无效。")
+    return {"mode": "http", "server": address, "port": port, "token": token}
+
+
+def subscription_url(publication, filename, local=False):
+    if filename not in SUBSCRIPTIONS:
+        raise ValueError("不支持的订阅格式。")
+    if publication.get("mode") == "http":
+        address = publication["server"]
+        if local:
+            address = "::1" if ":" in address else "127.0.0.1"
+        address = f"[{address}]" if ":" in address else address
+        base = f"http://{address}:{publication['port']}"
+    else:
+        base = publication["url"]
+    return f"{base}/hy-sub-{publication['token']}/{filename}"
+
+
+def check_subscription_port(value):
+    port = port_number(value)
+    if output(["ss", "-H", "-ltn", f"sport = :{port}"]):
+        raise ValueError(f"TCP {port} 已被占用，请换一个订阅端口。")
+    return port
+
+
+def write_http_subscription(state):
+    p = state["publication"]
+    http_publication(p["server"], p["port"], p["token"])
+    files = client_files(state)
+    document = {"owner": MARKER, "port": p["port"], "ipv6": ":" in p["server"],
+                "token": p["token"], "files": {name: files[name] for name in SUBSCRIPTIONS}}
+    path = subscription_config_path()
+    if path.exists() and json.loads(path.read_text(encoding="utf-8")).get("owner") != MARKER:
+        raise ValueError("订阅配置归属不明，拒绝覆盖。")
+    atomic_write(path, json_text(document), 0o640, group_id())
+
+
+class SubscriptionHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "HY-Subscription"
+    sys_version = ""
+
+    def setup(self):
+        self.request.settimeout(5)
+        super().setup()
+
+    def log_message(self, *_):
+        # 不把带有订阅密钥的请求路径写入日志。
+        pass
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        try:
+            data = json.loads(self.server.config_path.read_text(encoding="utf-8"))
+            parts = urllib.parse.urlsplit(self.path)
+            prefix, separator, filename = parts.path.rpartition("/")
+            valid = (data.get("owner") == MARKER and separator and filename in SUBSCRIPTIONS
+                     and secrets.compare_digest(prefix.encode(), ("/hy-sub-" + data["token"]).encode()))
+            body = data["files"][filename].encode() if valid else b"Not Found\n"
+            status = 200 if valid else 404
+        except (OSError, ValueError, KeyError, TypeError):
+            status, body = 503, b"Unavailable\n"
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+
+class SubscriptionServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, config_path, ipv6=False):
+        self.address_family = socket.AF_INET6 if ipv6 else socket.AF_INET
+        self.config_path = Path(config_path)
+        self.slots = threading.BoundedSemaphore(32)
+        super().__init__(address, SubscriptionHandler)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
+def serve_subscription():
+    path = subscription_config_path()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("owner") != MARKER or not re.fullmatch(r"[a-f0-9]{48}", data.get("token", "")):
+        raise ValueError("订阅配置无效。")
+    with SubscriptionServer(("::" if data["ipv6"] else "0.0.0.0", port_number(data["port"])),
+                            path, ipv6=data["ipv6"]) as server:
+        server.serve_forever()
+
+
+def activate_http_subscription(state):
+    path = subscription_config_path()
+    previous = path.read_bytes() if path.exists() else None
+    if previous is not None and json.loads(previous).get("owner") != MARKER:
+        raise ValueError("订阅配置归属不明，拒绝覆盖。")
+    unit = UNIT_DIR / SUB_SERVICE
+    if unit.exists() and MARKER not in unit.read_text():
+        raise ValueError("同名订阅服务不属于本工具，拒绝覆盖。")
+    was_active = subprocess.run(["systemctl", "is-active", "--quiet", SUB_SERVICE],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    was_enabled = subprocess.run(["systemctl", "is-enabled", "--quiet", SUB_SERVICE],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    previous_rules = firewall_records()
+    try:
+        write_http_subscription(state)
+        atomic_write(unit, units()[SUB_SERVICE], 0o644)
+        run(["systemctl", "daemon-reload"])
+        run(["systemctl", "restart", SUB_SERVICE])
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        last_error = None
+        for _ in range(20):
+            try:
+                with opener.open(subscription_url(state["publication"], "hiddify.txt", local=True), timeout=1) as response:
+                    if response.read() != client_files(state)["hiddify.txt"].encode():
+                        raise ValueError("订阅内容检查失败。")
+                last_error = None
+                break
+            except (OSError, ValueError) as exc:
+                last_error = exc
+                time.sleep(0.25)
+        if last_error:
+            raise ValueError("订阅服务启动失败，请查看 journalctl -u hy-subscription。") from last_error
+        run(["systemctl", "is-active", "--quiet", SUB_SERVICE])
+        firewall_apply({**state, "port": state["publication"]["port"]}, protocol="tcp")
+        run(["systemctl", "enable", SUB_SERVICE])
+        atomic_write(STATE, json_text(state))
+    except Exception:
+        if previous is not None:
+            atomic_write(path, previous, 0o640, group_id())
+            run(["systemctl", "restart" if was_active else "stop", SUB_SERVICE])
+            run(["systemctl", "enable" if was_enabled else "disable", SUB_SERVICE])
+        else:
+            run(["systemctl", "disable", "--now", SUB_SERVICE])
+            path.unlink(missing_ok=True)
+        firewall_prune(only=[r for r in firewall_records() if r not in previous_rules], protocol="tcp")
+        raise
+    print("本机订阅获取验证通过；外网访问还需要放行云安全组和本机防火墙。")
+    print(f"订阅使用 TCP {state['publication']['port']}；VPN 数据仍使用 UDP {state['port']}。")
+
+
 def publish_files(state):
     p = state["publication"]
+    if p.get("mode") == "http":
+        write_http_subscription(state)
+        for name, label in SUBSCRIPTIONS.items():
+            print(f"{label} 订阅：{subscription_url(p, name)}")
+        return
     publication_settings(p["root"], p["url"], p["token"])
     target = publication_dir(p)
     if target.exists() and (not (target / ".hy-owner").is_file() or (target / ".hy-owner").read_text() != MARKER):
@@ -732,7 +931,7 @@ def publish_files(state):
         atomic_write(target / name, files[name], 0o644)
     atomic_write(target / "index.html", "Not Found\n", 0o644)
     for name, label in SUBSCRIPTIONS.items():
-        url = f"{p['url']}/{target.name}/{name}"
+        url = subscription_url(p, name)
         print(f"{label} 订阅：{url}")
         try:
             request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
@@ -750,11 +949,26 @@ def publish():
     if old:
         print("刷新当前订阅文件。要换发布位置，请先运行 hy unpublish。")
     else:
-        print("文件包含节点凭据，随机路径就是订阅密钥；使用你自己的现有 HTTPS 网站。")
-        self_signed = state.get("cert_mode") == "selfsigned"
-        state["publication"] = publication_settings(
-            prompt("已有网站根目录", None if self_signed else f"/www/wwwroot/{state['domain']}"),
-            prompt("站点 HTTPS 根地址", None if self_signed else f"https://{state['domain']}"))
+        mode = choice("订阅方式：1=IP 直连 HTTP（无需域名），2=已有 HTTPS 网站", ("1", "2"), "1")
+        if mode == "1":
+            print("HTTP 订阅包含节点凭据，传输未加密；随机路径就是订阅密钥，请勿分享。")
+            try:
+                default_ip = ip_literal(state["server"])
+            except ValueError:
+                default_ip = detect_public_ip()
+            address = ask_valid("订阅服务器 IP", ip_literal, default_ip)
+            port = ask_valid("订阅 TCP 端口", check_subscription_port, 24444)
+            state["publication"] = http_publication(address, port)
+        else:
+            print("文件包含节点凭据，随机路径就是订阅密钥；使用你自己的现有 HTTPS 网站。")
+            self_signed = state.get("cert_mode") == "selfsigned"
+            state["publication"] = publication_settings(
+                prompt("已有网站根目录", None if self_signed else f"/www/wwwroot/{state['domain']}"),
+                prompt("站点 HTTPS 根地址", None if self_signed else f"https://{state['domain']}"))
+    if state["publication"].get("mode") == "http":
+        activate_http_subscription(state)
+        publish_files(state)
+        return
     # 先保存归属信息，网络验证失败时仍可撤销发布。
     atomic_write(STATE, json_text(state))
     publish_files(state)
@@ -765,6 +979,20 @@ def unpublish():
     p = state.get("publication")
     if not p:
         print("没有发布订阅。")
+        return
+    if p.get("mode") == "http":
+        unit = UNIT_DIR / SUB_SERVICE
+        if unit.exists() and MARKER not in unit.read_text():
+            raise ValueError("同名订阅服务不属于本工具，拒绝停用。")
+        if subscription_config_path().exists() and json.loads(subscription_config_path().read_text(encoding="utf-8")).get("owner") != MARKER:
+            raise ValueError("订阅配置归属不明，拒绝删除。")
+        if unit.exists():
+            run(["systemctl", "disable", "--now", SUB_SERVICE])
+        subscription_config_path().unlink(missing_ok=True)
+        firewall_prune(protocol="tcp")
+        del state["publication"]
+        atomic_write(STATE, json_text(state))
+        print("已关闭 IP 订阅服务并撤销链接；已经导入的节点仍可连接。")
         return
     target = publication_dir(p)
     if target.exists():
@@ -986,17 +1214,6 @@ def monitor_off():
     print("已关闭监控和限速。配置保留，下次 hy monitor 会恢复；取消单个 IP 限速用 hy unlimit IP。")
 
 
-@contextmanager
-def management_lock():
-    import fcntl
-    with open("/run/lock/demonyxp-hy.lock", "w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ValueError("另一个 hy 操作正在运行，请稍后重试。") from exc
-        yield
-
-
 def firewall_backend():
     active = []
     try:
@@ -1026,16 +1243,21 @@ def save_firewall(records):
 
 def firewall_command(record, action):
     port = port_number(record["port"])
+    protocol = record.get("protocol", "udp")
+    if protocol not in ("tcp", "udp"):
+        raise ValueError("无效的防火墙协议。")
     if record["backend"] == "ufw":
         return ["ufw", *(["--force", "delete"] if action == "remove" else []),
-                "allow", f"{port}/udp", "comment", record["comment"]]
+                "allow", f"{port}/{protocol}", "comment", record["comment"]]
     return ["firewall-cmd", *(["--permanent"] if record["permanent"] else []),
-            f"--zone={record['zone']}", f"--{action}-port={port}/udp"]
+            f"--zone={record['zone']}", f"--{action}-port={port}/{protocol}"]
 
 
-def firewall_prune(keep_port=None, only=None):
+def firewall_prune(keep_port=None, only=None, protocol="udp"):
     records = firewall_records()
     for record in records[:]:
+        if protocol is not None and record.get("protocol", "udp") != protocol:
+            continue
         if record["port"] == keep_port or (only is not None and record not in only):
             continue
         try:
@@ -1053,11 +1275,13 @@ def firewall_prune(keep_port=None, only=None):
             records.remove(record)
             save_firewall(records)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            print(f"未能清理自建 UDP {record['port']} 规则，记录已保留，可用 hy firewall 重试：{exc}")
+            print(f"未能清理自建 {record.get('protocol', 'udp').upper()} {record['port']} 规则，记录已保留：{exc}")
     return records
 
 
-def firewall_apply(state):
+def firewall_apply(state, protocol="udp"):
+    if protocol not in ("udp", "tcp"):
+        raise ValueError("无效的防火墙协议。")
     if state.get("firewall_mode") != "auto":
         return
     backend = firewall_backend()
@@ -1066,13 +1290,14 @@ def firewall_apply(state):
         return
     records = firewall_records()
     port = state["port"]
+    extra = {"protocol": "tcp"} if protocol == "tcp" else {}
     candidates = []
     if backend == "ufw":
         added = output(["ufw", "show", "added"])
-        if any(shlex.split(line)[:3] == ["ufw", "allow", f"{port}/udp"] for line in added.splitlines()):
-            print(f"UFW 已有 UDP {port} 放行规则，复用现有规则。")
+        if any(shlex.split(line)[:3] == ["ufw", "allow", f"{port}/{protocol}"] for line in added.splitlines()):
+            print(f"UFW 已有 {protocol.upper()} {port} 放行规则，复用现有规则。")
             return
-        candidates.append({"backend": backend, "port": port, "comment": "hy-" + secrets.token_hex(8)})
+        candidates.append({"backend": backend, "port": port, "comment": "hy-" + secrets.token_hex(8), **extra})
     else:
         active = output(["firewall-cmd", "--get-active-zones"])
         # 新版 firewalld 会在区域名后附加 "(default)"。
@@ -1081,7 +1306,7 @@ def firewall_apply(state):
             print("firewalld 活跃区域不唯一，请手动选择区域放行，未修改规则。")
             return
         for permanent in (False, True):
-            record = {"backend": backend, "port": port, "zone": zones[0], "permanent": permanent}
+            record = {"backend": backend, "port": port, "zone": zones[0], "permanent": permanent, **extra}
             result = subprocess.run(firewall_command(record, "query"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if result.returncode not in (0, 1):
                 raise ValueError("firewalld 查询失败，未添加规则。")
@@ -1096,9 +1321,9 @@ def firewall_apply(state):
             save_firewall(records)
             run(firewall_command(record, "add"), stdout=subprocess.DEVNULL)
     except Exception:
-        firewall_prune(only=[record for record in records if record not in previous])
+        firewall_prune(only=[record for record in records if record not in previous], protocol=protocol)
         raise
-    print(f"已处理本机 {backend} 的 UDP {port} 放行；云安全组仍需自行设置。")
+    print(f"已处理本机 {backend} 的 {protocol.upper()} {port} 放行；云安全组仍需自行设置。")
 
 
 def firewall_setup():
@@ -1107,6 +1332,10 @@ def firewall_setup():
     state["firewall_mode"] = "auto" if mode == "1" else "manual"
     firewall_apply(state)
     firewall_prune(state["port"] if mode == "1" else None)
+    if state.get("publication", {}).get("mode") == "http":
+        port = state["publication"]["port"]
+        firewall_apply({**state, "port": port}, protocol="tcp")
+        firewall_prune(port if mode == "1" else None, protocol="tcp")
     atomic_write(STATE, json_text(state))
     firewall_hint(state)
 
@@ -1114,7 +1343,10 @@ def firewall_setup():
 def firewall_hint(state):
     print(f"\n请在云安全组和宝塔防火墙放行 UDP {state['port']}。")
     print(f"若正在使用 UFW，可执行：ufw allow {state['port']}/udp")
-    print("不需要新增 TCP 订阅端口；HTTPS 订阅使用现有网站。")
+    if state.get("publication", {}).get("mode") == "http":
+        print(f"IP 订阅另需放行 TCP {state['publication']['port']}。")
+    else:
+        print("使用已有 HTTPS 网站无需新增订阅端口；创建 IP 订阅时另行提示 TCP 端口。")
 
 
 def start():
@@ -1136,6 +1368,10 @@ def status():
     print(f"服务：{active} | 开机启动：{'开启' if enabled else '关闭'} | 内核：{state.get('core_version', '未知')}")
     mode = "纯 IP / 自签证书" if state.get("cert_mode") == "selfsigned" else "域名 / 已有证书"
     print(f"模式：{mode} | 连接：{state['server']} UDP {state['port']}")
+    if state.get("publication", {}).get("mode") == "http":
+        active = subprocess.run(["systemctl", "is-active", "--quiet", SUB_SERVICE],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        print(f"IP 订阅：{'运行中' if active else '已停止'} | TCP {state['publication']['port']}")
 
 
 def autostart(enabled):
@@ -1185,11 +1421,14 @@ def uninstall():
         print("已取消。")
         return
     saved = backup()
-    if firewall_prune():
+    if firewall_prune(protocol=None):
         raise ValueError("自建防火墙规则尚未清理完，已保留安装。请修复防火墙后重新运行 hy uninstall。")
     if state.get("traffic"):
         save_traffic(state, {**state["traffic"], "enabled": False})
     unpublish()
+    subscription_unit = UNIT_DIR / SUB_SERVICE
+    if subscription_unit.exists() and MARKER in subscription_unit.read_text():
+        run(["systemctl", "disable", "--now", SUB_SERVICE])
     run(["systemctl", "disable", "--now", "hy-cert-sync.timer", SERVICE])
     subprocess.run(["systemctl", "stop", "hy-cert-sync.service"], check=False)
     for name in units():
@@ -1208,7 +1447,7 @@ def uninstall():
 
 def main():
     parser = argparse.ArgumentParser(description="HY：中文 Hysteria2 单节点管理工具")
-    parser.add_argument("command", nargs="?", default="menu", choices=["menu", "install", "configure", "update", "self-update", "status", "firewall", "enable", "disable", "export", "publish", "unpublish", "sync-cert", "doctor", "logs", "start", "stop", "restart", "backup", "uninstall", "monitor", "limit", "unlimit", "limits", "monitor-off", "traffic-apply"])
+    parser.add_argument("command", nargs="?", default="menu", choices=["menu", "install", "configure", "update", "self-update", "status", "firewall", "enable", "disable", "export", "publish", "unpublish", "sync-cert", "doctor", "logs", "start", "stop", "restart", "backup", "uninstall", "monitor", "limit", "unlimit", "limits", "monitor-off", "traffic-apply", "serve-subscription"])
     parser.add_argument("ip", nargs="?", help="需要限速的客户端公网 IP")
     parser.add_argument("--upload", type=rate_mbps, help="客户端上传上限 Mbps，0 不限")
     parser.add_argument("--download", type=rate_mbps, help="客户端下载上限 Mbps，0 不限")
@@ -1217,6 +1456,9 @@ def main():
     if (args.ip and args.command not in ("limit", "unlimit")) or (args.once and args.command != "monitor") or \
        ((args.upload is not None or args.download is not None) and args.command != "limit"):
         parser.error("IP 仅用于 limit/unlimit；速率仅用于 limit；--once 仅用于 monitor。")
+    if args.command == "serve-subscription":
+        serve_subscription()
+        return
     if platform.system() != "Linux" or os.geteuid() != 0 or not Path("/run/systemd/system").is_dir():
         raise ValueError("请在使用 systemd 的 Linux 服务器上以 root 运行。")
     actions = {"install": install, "configure": configure, "update": update, "self-update": self_update,
@@ -1231,12 +1473,10 @@ def main():
                "unlimit": lambda: remove_limit(args.ip), "limits": show_limits,
                "monitor-off": monitor_off, "traffic-apply": lambda: apply_traffic(load_state())}
     def dispatch(command):
-        # 长时间显示监控和等待菜单输入时不持有写锁，允许另一终端实时调整限速。
-        with management_lock():
-            if command == "monitor":
-                ensure_monitor()
-            else:
-                actions[command]()
+        if command == "monitor":
+            ensure_monitor()
+        else:
+            actions[command]()
         if command == "monitor":
             try:
                 monitor(once=args.once)
@@ -1247,7 +1487,7 @@ def main():
         return
     groups = [
         ("安装与配置", [("快速 / 高级安装（已安装时刷新管理器）", "install"), ("修改节点配置", "configure"), ("设置端口放行", "firewall")]),
-        ("连接与订阅", [("按客户端导入", "export-client"), ("查看全部导出", "export"), ("发布 / 刷新 HTTPS 订阅", "publish"), ("撤销订阅", "unpublish")]),
+        ("连接与订阅", [("按客户端导入", "export-client"), ("查看全部导出", "export"), ("发布 / 刷新 IP 或 HTTPS 订阅", "publish"), ("撤销订阅", "unpublish")]),
         ("服务管理", [("启动并开启开机启动", "start"), ("停止（不改变开机启动）", "stop"), ("重启", "restart"), ("开启开机启动", "enable"), ("关闭开机启动（不停止服务）", "disable")]),
         ("监控与限速", [("客户端 IP 实时流量", "monitor"), ("设置 IP 上下行限速", "limit"), ("取消 IP 限速", "unlimit"), ("查看限速配置", "limits"), ("关闭监控和限速", "monitor-off")]),
         ("更新与维护", [("更新管理脚本", "self-update"), ("更新官方内核", "update"), ("诊断", "doctor"), ("查看日志", "logs"), ("备份配置", "backup"), ("卸载", "uninstall")])]
