@@ -4,7 +4,8 @@ permissions:
   contents: read
 jobs:
   unit:
-    runs-on: ubuntu-latest
+    # Python 3.9 无 Ubuntu 26.04 构建，固定兼容运行器验证 Amazon Linux 的系统 Python。
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         python-version: ['3.9', '3.12']
