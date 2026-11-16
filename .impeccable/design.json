@@ -1,0 +1,8 @@
+{
+  "platform": "web",
+  "tokens": {
+    "color": {"paper": "#f4f5f1", "ink": "#213a35", "muted": "#596d65", "accent": "#17664f", "download": "#376ba0", "line": "#dce3dc", "danger": "#ad3939"},
+    "radius": {"surface": "12px", "control": "7px"},
+    "fontSize": {"body": "14px", "small": "12px", "title": "30px"}
+  }
+}

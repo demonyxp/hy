@@ -26,7 +26,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 MANAGER_URL = "https://raw.githubusercontent.com/demonyxp/hy"
 REPO = "HyNetworks/hysteria"
 ETC = Path("/etc/hy")
@@ -1415,6 +1415,39 @@ def doctor():
     print("本机诊断不能证明公网 UDP、客户端握手或实际速度；请用导出的配置连接验证。")
 
 
+def web_module(download=False):
+    import importlib.util
+    target = LIB / "hy_web.py"
+    if download:
+        release = json.loads(fetch_manager(f"{MANAGER_URL}/v{VERSION}/release.json"))
+        content = fetch_manager(f"{MANAGER_URL}/v{VERSION}/hy_web.py")
+        if release.get("version") != VERSION or hashlib.sha256(content).hexdigest() != release.get("web_sha256"):
+            raise ValueError("可视化面板 SHA-256 校验失败。")
+        compile(content, "hy_web.py", "exec")
+        atomic_write(target, content, 0o755)
+    if not target.exists():
+        raise ValueError("尚未安装可视化面板，请运行 hy web-install。")
+    spec = importlib.util.spec_from_file_location("hy_web", target)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def web_install(root=None, origin=None, port=None):
+    load_state()
+    target = LIB / "hy_web.py"
+    previous = target.read_bytes() if target.exists() else None
+    try:
+        web_module(download=True).install(root, origin, port)
+    except Exception:
+        if previous is None:
+            target.unlink(missing_ok=True)
+        else:
+            atomic_write(target, previous, 0o755)
+            subprocess.run(["systemctl", "try-restart", "hy-web.service"], check=False)
+        raise
+
+
 def uninstall():
     state = load_state()
     if prompt("将停用并删除本工具的服务和配置，输入 UNINSTALL 确认") != "UNINSTALL":
@@ -1423,6 +1456,8 @@ def uninstall():
     saved = backup()
     if firewall_prune(protocol=None):
         raise ValueError("自建防火墙规则尚未清理完，已保留安装。请修复防火墙后重新运行 hy uninstall。")
+    if Path("/etc/hy-web/config.json").exists():
+        web_module().uninstall(confirm=False)
     if state.get("traffic"):
         save_traffic(state, {**state["traffic"], "enabled": False})
     unpublish()
@@ -1447,12 +1482,17 @@ def uninstall():
 
 def main():
     parser = argparse.ArgumentParser(description="HY：中文 Hysteria2 单节点管理工具")
-    parser.add_argument("command", nargs="?", default="menu", choices=["menu", "install", "configure", "update", "self-update", "status", "firewall", "enable", "disable", "export", "publish", "unpublish", "sync-cert", "doctor", "logs", "start", "stop", "restart", "backup", "uninstall", "monitor", "limit", "unlimit", "limits", "monitor-off", "traffic-apply", "serve-subscription"])
+    parser.add_argument("command", nargs="?", default="menu", choices=["menu", "install", "configure", "update", "self-update", "status", "firewall", "enable", "disable", "export", "publish", "unpublish", "sync-cert", "doctor", "logs", "start", "stop", "restart", "backup", "uninstall", "monitor", "limit", "unlimit", "limits", "monitor-off", "traffic-apply", "serve-subscription", "web-install", "web-status", "web-password", "web-uninstall"])
     parser.add_argument("ip", nargs="?", help="需要限速的客户端公网 IP")
     parser.add_argument("--upload", type=rate_mbps, help="客户端上传上限 Mbps，0 不限")
     parser.add_argument("--download", type=rate_mbps, help="客户端下载上限 Mbps，0 不限")
     parser.add_argument("--once", action="store_true", help="监控只采样一次")
+    parser.add_argument("--web-root", help="可选面板部署到此网站根目录的 hy/ 子目录")
+    parser.add_argument("--web-origin", help="面板已有 HTTPS 网站源地址")
+    parser.add_argument("--web-port", type=port_number, help="面板本机监听端口，默认 31244")
     args = parser.parse_args()
+    if any(v is not None for v in (args.web_root, args.web_origin, args.web_port)) and args.command != "web-install":
+        parser.error("--web-* 参数仅用于 web-install。")
     if (args.ip and args.command not in ("limit", "unlimit")) or (args.once and args.command != "monitor") or \
        ((args.upload is not None or args.download is not None) and args.command != "limit"):
         parser.error("IP 仅用于 limit/unlimit；速率仅用于 limit；--once 仅用于 monitor。")
@@ -1471,7 +1511,11 @@ def main():
                "stop": lambda: run(["systemctl", "stop", SERVICE]), "backup": lambda: (load_state(), backup()),
                "uninstall": uninstall, "limit": lambda: set_limit(args.ip, args.upload, args.download),
                "unlimit": lambda: remove_limit(args.ip), "limits": show_limits,
-               "monitor-off": monitor_off, "traffic-apply": lambda: apply_traffic(load_state())}
+               "monitor-off": monitor_off, "traffic-apply": lambda: apply_traffic(load_state()),
+               "web-install": lambda: web_install(args.web_root, args.web_origin, args.web_port),
+               "web-password": lambda: web_module().reset_password(),
+               "web-uninstall": lambda: web_module().uninstall(),
+               "web-status": lambda: run(["systemctl", "status", "hy-web.service", "--no-pager"])}
     def dispatch(command):
         if command == "monitor":
             ensure_monitor()
@@ -1490,7 +1534,8 @@ def main():
         ("连接与订阅", [("按客户端导入", "export-client"), ("查看全部导出", "export"), ("发布 / 刷新 IP 或 HTTPS 订阅", "publish"), ("撤销订阅", "unpublish")]),
         ("服务管理", [("启动并开启开机启动", "start"), ("停止（不改变开机启动）", "stop"), ("重启", "restart"), ("开启开机启动", "enable"), ("关闭开机启动（不停止服务）", "disable")]),
         ("监控与限速", [("客户端 IP 实时流量", "monitor"), ("设置 IP 上下行限速", "limit"), ("取消 IP 限速", "unlimit"), ("查看限速配置", "limits"), ("关闭监控和限速", "monitor-off")]),
-        ("更新与维护", [("更新管理脚本", "self-update"), ("更新官方内核", "update"), ("诊断", "doctor"), ("查看日志", "logs"), ("备份配置", "backup"), ("卸载", "uninstall")])]
+        ("更新与维护", [("更新管理脚本", "self-update"), ("更新官方内核", "update"), ("诊断", "doctor"), ("查看日志", "logs"), ("备份配置", "backup"), ("卸载", "uninstall")]),
+        ("可视化面板（默认不安装）", [("安装 / 更新面板", "web-install"), ("查看面板状态", "web-status"), ("修改面板密码", "web-password"), ("只卸载面板", "web-uninstall")])]
     while True:
         status()
         for i, (label, _) in enumerate(groups, 1):
@@ -1510,7 +1555,7 @@ def main():
                 continue
             try:
                 dispatch(options[int(selection) - 1][1])
-                if options[int(selection) - 1][1] == "self-update":
+                if options[int(selection) - 1][1] == "self-update" or not Path(__file__).exists():
                     return
             except Exception as exc:
                 print(f"操作失败：{exc}", file=sys.stderr)

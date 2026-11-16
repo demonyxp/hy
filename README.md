@@ -16,7 +16,51 @@ bash <(curl -fsSL https://raw.githubusercontent.com/demonyxp/hy/main/install.sh)
 
 公网 IP 识别通过 HTTPS 查询 ipify / ifconfig.co，IPv4 优先，失败尝试 IPv6；总查询时间最多约 20 秒。失败后手动输入。默认端口为 `24443`，冲突时检查至 `24453`，均占用则手动指定。自动识别结果是公网出口地址；NAT、多 IP 服务器应核对地址和 UDP 转发。
 
-需要固定版本时，把命令中的 `main` 换成 `v0.5.0`。首次安装和交互菜单需要终端；SSH 远程执行请使用 `ssh -t`。不会把管道输入或无人值守环境当作确认。
+需要固定版本时，把命令中的 `main` 换成 `v0.6.0`。首次安装和交互菜单需要终端；SSH 远程执行请使用 `ssh -t`。不会把管道输入或无人值守环境当作确认。
+
+## 可选可视化面板（v0.6.0）
+
+**默认不下载、不安装、不启动网页面板。** 使用命令行的用户不增加后台服务或开放端口。需要时先升级管理器，再执行：
+
+```bash
+hy web-install --web-root /www/wwwroot/panel.example.com --web-origin https://panel.example.com
+```
+
+也可以在 `hy` 主菜单选择「可视化面板」，交互填写已有网站根目录和 HTTPS 地址。面板部署在指定根目录的 `hy/` 子目录，访问地址为 `https://panel.example.com/hy/`；不会覆盖根路径原有网站。没有已有 HTTPS 网站时，继续使用 CLI 即可；此功能不申请证书、不修改云安全组。
+
+安装器验证面板代码、页面的发布版本和 SHA-256，并生成独立管理员密码。用户名为 `admin`；初始密码只在安装终端显示，请保存。凭据以带盐 scrypt 哈希存储在 `/etc/hy-web/config.json`，不写入网站目录。
+
+将以下一行加在该网站 Nginx 的 **server 块内**（不要放在 location 内），检查配置后重载 Nginx：
+
+```nginx
+include /etc/hy-web/nginx.conf;
+```
+
+宝塔示例：
+
+```bash
+/www/server/nginx/sbin/nginx -t && /www/server/nginx/sbin/nginx -s reload
+```
+
+后端 `hy-web.service` 只监听 `127.0.0.1:31244`，仅通过网站 HTTPS 反代访问；端口冲突可安装时指定 `--web-port`。请勿将后端暴露到公网。面板不开放注册，登录有频率限制，写操作验证 Origin、会话和 CSRF。会话最多 8 小时，服务重启或修改密码后失效。
+
+面板提供：
+
+- 节点、服务、系统资源状态；最近三分钟 HY2 流量曲线。
+- 客户端公网 IP 流量、累计值、上下行限速；复用已有 nftables 实现。未开启统计时明确显示，并提供「启用流量监控」。浏览页面本身不会重建规则。
+- 启动、停止、重启以及独立的开机启动开关。停止/重启会中断 VPN；如果通过该 VPN 访问面板，操作后也可能暂时无法访问页面。
+- HY2 链接、Hiddify、v2rayN、Clash/Mihomo、FlClash、sing-box 导出；已有订阅地址可复制。导出包含节点凭据，请勿公开。
+
+「最近有流量」只代表采样期间看到数据包，不能证明客户端已认证在线。统计包含 HY2 UDP 协议开销，不包含网站、SSH 和其他服务；相同公网 IP 共用限速。累计计数重建会清零，单方向空闲 24 小时会过期。页面每三秒采样，仅显示流量最高的前 200 个 IP。限速是令牌桶丢包机制，实际速度可能低于设置值。
+
+```bash
+hy web-status       # 查看面板服务
+hy web-password     # 在 SSH 交互修改登录密码
+hy web-install      # 更新面板，保留原网站地址和密码
+hy web-uninstall    # 只卸载面板，保留 VPN
+```
+
+`hy self-update` 仍只更新管理器；已安装面板时，随后再执行 `hy web-install` 更新面板文件。面板安装失败会恢复原配置、页面和服务状态。卸载仅移除本工具的页面与凭据，用户额外放进 hy/ 的文件保留；Nginx include 片段保留为空文件，避免网站重载失败，可以手动移除该 include。整体 `hy uninstall` 会先清理面板。
 
 Amazon Linux 2023 的 `ec2-user` 用户先单独执行 `sudo -i`，看到 root 提示符后再运行安装命令。安装器自动使用 DNF 补齐依赖，不升级整个系统；沿用系统 Python 3.9 和已经可用的 curl/curl-minimal。域名证书使用 OpenSSL 的系统默认 CA 信任库验证。与 sing-box 共存时使用不同的监听端口，安装器不会停止或覆盖 sing-box；在 AWS 安全组另行放行选定的 UDP 端口。
 
