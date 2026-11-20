@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""面向 Debian / Ubuntu / Amazon Linux 2023 的 Hysteria2 单节点管理器。"""
+"""面向 Debian / Ubuntu / Amazon Linux 2023 的 HY2 / VLESS 管理器。"""
 
 import argparse
 import base64
@@ -26,7 +26,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 MANAGER_URL = "https://raw.githubusercontent.com/demonyxp/hy"
 REPO = "HyNetworks/hysteria"
 ETC = Path("/etc/hy")
@@ -41,6 +41,357 @@ MARKER = "demonyxp/hy"
 TRAFFIC_TABLE = "hy_traffic"
 TRAFFIC_SERVICE = "hy-traffic.service"
 SUB_SERVICE = "hy-subscription.service"
+VLESS_SERVICE = "hy-vless.service"
+# 固定跨客户端验证过的官方稳定版。
+VLESS_CORE_VERSION = "v1.14.4"
+
+
+def vless_binary():
+    return LIB / "sing-box-vless"
+
+
+def vless_uri(v):
+    host = f"[{v['server']}]" if ":" in v['server'] else v['server']
+    query = {"encryption": "none", "security": "reality", "type": "tcp", "flow": "xtls-rprx-vision",
+             "sni": v["sni"], "fp": "chrome", "pbk": v["public_key"], "sid": v["short_id"], "spx": "/"}
+    return f"vless://{v['uuid']}@{host}:{v['port']}?{urllib.parse.urlencode(query)}#{urllib.parse.quote(v['name'], safe='')}"
+
+
+def vless_config(v):
+    listen = "::"
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(("::", 0))
+    except OSError:
+        if ":" in v["server"]:
+            raise ValueError("系统未启用 IPv6，不能使用 IPv6 连接地址。")
+        listen = "0.0.0.0"
+    target_host, target_port = v["target"].rsplit(":", 1)
+    return {"log": {"level": "warn"}, "inbounds": [{"type": "vless", "tag": "vless-reality",
+            "listen": listen, "listen_port": port_number(v["port"]),
+            "users": [{"uuid": v["uuid"], "flow": "xtls-rprx-vision"}],
+            "tls": {"enabled": True, "server_name": v["sni"], "reality": {
+                "enabled": True, "handshake": {"server": target_host, "server_port": int(target_port)},
+                "private_key": v["private_key"], "short_id": [v["short_id"]]}}}],
+            "outbounds": [{"type": "direct", "tag": "direct"}]}
+
+
+
+def vless_unit():
+    return f"""# {MARKER}
+[Unit]
+Description=HY optional VLESS REALITY server
+After=network-online.target
+Wants=network-online.target
+[Service]
+User={USER}
+Group={USER}
+ExecStart={vless_binary()} run -c {ETC}/vless.json
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def download_vless_core(destination):
+    import tarfile
+    repository = "SagerNet/sing-box"
+    release = json.loads(output(["curl", "-fsSL", "--proto", "=https", "--proto-redir", "=https",
+                                 "--connect-timeout", "15", "--max-time", "60", "--retry", "2",
+                                 f"https://api.github.com/repos/{repository}/releases/tags/{VLESS_CORE_VERSION}"]))
+    tag = release.get("tag_name", "")
+    if release.get("draft") or release.get("prerelease") or tag != VLESS_CORE_VERSION:
+        raise ValueError("未找到指定的官方 sing-box 兼容版本。")
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
+    name = f"sing-box-{tag[1:]}-linux-{arch}.tar.gz"
+    asset = next((a for a in release.get("assets", []) if a["name"] == name), None)
+    if not asset or not re.fullmatch(r"sha256:[a-f0-9]{64}", asset.get("digest") or ""):
+        raise ValueError("缺少对应架构的官方 sing-box SHA-256 信息。")
+    if asset["browser_download_url"] != f"https://github.com/{repository}/releases/download/{tag}/{name}":
+        raise ValueError("sing-box 下载地址不属于官方发行版。")
+    with tempfile.TemporaryDirectory(prefix="hy-vless-download-") as tmp:
+        archive = Path(tmp) / "core.tar.gz"
+        run(["curl", "-fSL", "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "15",
+             "--max-time", "300", "--retry", "2", "-o", archive, asset["browser_download_url"]])
+        if hashlib.sha256(archive.read_bytes()).hexdigest() != asset["digest"].split(":")[1]:
+            raise ValueError("sing-box SHA-256 校验失败。")
+        # 只提取固定文件，不展开归档路径或附带文件。
+        with tarfile.open(archive, "r:gz") as source:
+            member = source.getmember(name[:-7] + "/sing-box")
+            if not member.isfile() or member.size > 150 * 1024 * 1024:
+                raise ValueError("官方归档中的核心文件无效。")
+            atomic_write(destination, source.extractfile(member).read(), 0o755)
+    return tag
+
+
+def reality_keys(binary):
+    lines = output([binary, "generate", "reality-keypair"])
+    parsed = {k.lower().replace(" ", ""): v.strip() for k, _, v in
+              (line.partition(":") for line in lines.splitlines())}
+    private = parsed.get("privatekey", "")
+    public = parsed.get("password(publickey)", parsed.get("password", parsed.get("publickey", "")))
+    if not all(re.fullmatch(r"[A-Za-z0-9_-]{43}", k) for k in (private, public)):
+        raise ValueError("无法识别 sing-box 的 X25519 密钥输出。")
+    return private, public
+
+
+def reality_target(value):
+    host, colon, port = str(value).rpartition(":")
+    if colon != ":" or port != "443":
+        raise ValueError("REALITY 目标请输入支持 TLS 1.3 的公网域名:443。")
+    return domain(host) + ":443"
+
+
+def check_reality_target(target, sni):
+    import ssl
+    host = reality_target(target).rsplit(":", 1)[0]
+    sni = domain(sni)
+    addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
+        raise ValueError("REALITY 目标必须解析到公网地址。")
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
+    context.set_alpn_protocols(["h2"])
+    with socket.create_connection((host, 443), timeout=8) as conn:
+        with context.wrap_socket(conn, server_hostname=sni) as tls:
+            if tls.selected_alpn_protocol() != "h2":
+                raise ValueError("REALITY 目标未协商 HTTP/2，请换一个目标。")
+
+
+def vless_active():
+    return subprocess.run(["systemctl", "is-active", "--quiet", VLESS_SERVICE],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def check_vless_port(value, old=None):
+    port = port_number(value)
+    publication = load_state().get("publication", {})
+    if publication.get("mode") == "http" and port == publication.get("port"):
+        raise ValueError("该 TCP 端口已用于订阅服务。")
+    if old and port == old["port"] and vless_active():
+        return port
+    if output(["ss", "-H", "-lnt", f"sport = :{port}"]):
+        raise ValueError(f"TCP {port} 已被占用。")
+    return port
+
+
+def vless_commit(state, v, candidate=None):
+    unit = UNIT_DIR / VLESS_SERVICE
+    binary = vless_binary()
+    if unit.exists() and MARKER not in unit.read_text():
+        raise ValueError("同名 sing-box 服务不属于本工具。")
+    if not state.get("vless") and any(p.exists() for p in (binary, ETC / "vless.json")):
+        raise ValueError("已有 sing-box 文件归属不明，拒绝覆盖。")
+    new = {**state, "vless": v}
+    # 先验证候选核心和配置，验证失败不触碰正在运行的服务。
+    with tempfile.TemporaryDirectory(prefix="hy-vless-check-") as tmp:
+        cfg = Path(tmp) / "config.json"
+        atomic_write(cfg, json_text(vless_config(v)))
+        run([candidate or binary, "check", "-c", cfg], stdout=subprocess.DEVNULL)
+    backup()
+    paths = [STATE, ETC / "vless.json", unit] + ([binary] if candidate else [])
+    previous = {p: p.read_bytes() if p.exists() else None for p in paths}
+    rules_before = firewall_records()
+    was_active = vless_active()
+    was_enabled = subprocess.run(["systemctl", "is-enabled", "--quiet", VLESS_SERVICE],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    try:
+        if candidate:
+            atomic_write(binary, Path(candidate).read_bytes(), 0o755)
+        atomic_write(ETC / "vless.json", json_text(vless_config(v)), 0o640, group_id())
+        atomic_write(STATE, json_text(new))
+        atomic_write(unit, vless_unit(), 0o644)
+        run(["systemctl", "daemon-reload"])
+        firewall_apply({**new, "port": v["port"]}, protocol="tcp")
+        if new.get("traffic", {}).get("enabled"):
+            apply_traffic(new)
+        if was_active or not state.get("vless"):
+            run(["systemctl", "restart", VLESS_SERVICE])
+            for _ in range(4):
+                time.sleep(0.5)
+                if not vless_active():
+                    raise ValueError("sing-box 启动后退出，请查看 hy vless-logs。")
+            if not output(["ss", "-H", "-lnt", f"sport = :{v['port']}"]):
+                raise ValueError("sing-box 未监听预期端口。")
+        if not state.get("vless"):
+            run(["systemctl", "enable", VLESS_SERVICE])
+        export_files(new, show=False)
+        if new.get("publication"):
+            publish_files(new)
+    except Exception:
+        subprocess.run(["systemctl", "stop", VLESS_SERVICE], check=False)
+        firewall_prune(only=[r for r in firewall_records() if r not in rules_before], protocol="tcp")
+        if not was_enabled:
+            subprocess.run(["systemctl", "disable", VLESS_SERVICE], check=False)
+        for path, data in previous.items():
+            if data is None:
+                path.unlink(missing_ok=True)
+            else:
+                mode = 0o755 if path == binary else 0o644 if path == unit else 0o640 if path.name == "vless.json" else 0o600
+                atomic_write(path, data, mode, group_id() if path.name == "vless.json" else None)
+        run(["systemctl", "daemon-reload"])
+        if state.get("traffic", {}).get("enabled"):
+            apply_traffic(state)
+        if was_active:
+            run(["systemctl", "start", VLESS_SERVICE])
+        export_files(state, show=False)
+        if state.get("publication"):
+            publish_files(state)
+        raise
+    old = state.get("vless")
+    if old and old["port"] != v["port"]:
+        firewall_prune(only=[r for r in firewall_records() if r["port"] == old["port"]], protocol="tcp")
+    print(f"VLESS/REALITY 已配置：{v['server']} TCP {v['port']}。请在云安全组放行此 TCP 端口。")
+    print("现有订阅地址已保留；在客户端刷新订阅可获得两个节点。服务启动不代表公网一定可连接。")
+
+
+def vless_install(port=None, target=None, sni=None, server=None, yes=False, configure=False):
+    import uuid
+    state = load_state()
+    old = state.get("vless")
+    if old and not configure:
+        print("VLESS 已安装。修改参数用 hy vless-configure，更新内核用 hy vless-update。")
+        return
+    if configure and not old:
+        raise ValueError("请先运行 hy vless-install。")
+    if not yes and not sys.stdin.isatty():
+        raise ValueError("需要交互终端；无人值守安装请显式传入 --yes。")
+    defaults = old or {"server": state["server"], "target": "www.microsoft.com:443", "sni": "www.microsoft.com"}
+    if port is None:
+        if old:
+            port = old["port"]
+        else:
+            for test in range(24445, 24455):
+                try:
+                    port = check_vless_port(test)
+                    break
+                except ValueError:
+                    continue
+            if port is None:
+                raise ValueError("TCP 24445～24454 均不可用，请指定 --vless-port。")
+    port = check_vless_port(port, old)
+    server = endpoint(server or defaults["server"])
+    target = reality_target(target or defaults["target"])
+    sni = domain(sni or (target.rsplit(":", 1)[0] if target != defaults["target"] else defaults["sni"]))
+    if not yes:
+        server = ask_valid("VLESS 连接地址（IP 或域名）", endpoint, server)
+        port = ask_valid("VLESS TCP 端口", lambda p: check_vless_port(p, old), port)
+        while True:
+            target = ask_valid("REALITY 公网目标（TLS 1.3 / h2）", reality_target, target)
+            sni = ask_valid("REALITY SNI", domain, target.rsplit(":", 1)[0])
+            try:
+                check_reality_target(target, sni)
+                break
+            except (ValueError, OSError) as exc:
+                print(f"目标验证失败：{exc}，请重新填写。")
+        print(f"VLESS/REALITY：{server}:{port}，目标 {target}，保留 HY2。")
+        if prompt("确认部署？y/N", "n").lower() != "y":
+            return
+    else:
+        check_reality_target(target, sni)
+    with tempfile.TemporaryDirectory(prefix="hy-vless-") as tmp:
+        candidate = None
+        if not old:
+            candidate = Path(tmp) / "sing-box"
+            version = download_vless_core(candidate)
+            private, public = reality_keys(candidate)
+            old = {"uuid": str(uuid.uuid4()), "private_key": private, "public_key": public,
+                   "short_id": secrets.token_hex(8), "core_version": version, "name": state["name"] + " · VLESS"}
+        vless_commit(state, {**old, "server": server, "port": port, "target": target, "sni": sni}, candidate)
+
+
+def vless_update():
+    state = load_state()
+    if not state.get("vless"):
+        raise ValueError("尚未安装 VLESS。")
+    installed = state["vless"].get("core_version", "")
+    if re.fullmatch(r"v\d+\.\d+\.\d+", installed) and tuple(map(int, installed[1:].split("."))) > tuple(map(int, VLESS_CORE_VERSION[1:].split("."))):
+        raise ValueError("当前 sing-box 高于管理器固定的兼容版，拒绝自动降级。")
+    with tempfile.TemporaryDirectory(prefix="hy-vless-update-") as tmp:
+        candidate = Path(tmp) / "sing-box"
+        version = download_vless_core(candidate)
+        if candidate.read_bytes() == vless_binary().read_bytes():
+            print(f"sing-box 已是当前管理器验证的兼容版本 {VLESS_CORE_VERSION}。")
+            return
+        vless_commit(state, {**state["vless"], "core_version": version}, candidate)
+
+
+def vless_remove(confirm=True):
+    state = load_state()
+    v = state.get("vless")
+    if not v:
+        print("尚未安装 VLESS。")
+        return
+    unit = UNIT_DIR / VLESS_SERVICE
+    if unit.exists() and MARKER not in unit.read_text():
+        raise ValueError("sing-box 服务归属不符。")
+    if confirm and prompt("只移除 VLESS，保留 HY2；输入 REMOVE 确认") != "REMOVE":
+        return
+    backup()
+    selected = [r for r in firewall_records() if r["port"] == v["port"] and r.get("protocol", "udp") == "tcp"]
+    active = vless_active()
+    enabled = subprocess.run(["systemctl", "is-enabled", "--quiet", VLESS_SERVICE],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    new = dict(state)
+    del new["vless"]
+    paths = (unit, ETC / "vless.json", vless_binary())
+    saved = {p: p.read_bytes() if p.exists() else None for p in paths}
+    try:
+        remaining = firewall_prune(only=selected, protocol="tcp")
+        if any(r in remaining for r in selected):
+            raise ValueError("VLESS 防火墙规则未清理完，已回滚并保留安装。")
+        run(["systemctl", "disable", "--now", VLESS_SERVICE])
+        atomic_write(STATE, json_text(new))
+        if new.get("traffic", {}).get("enabled"):
+            apply_traffic(new)
+        export_files(new, show=False)
+        if new.get("publication"):
+            publish_files(new)
+        for path in paths:
+            path.unlink(missing_ok=True)
+        run(["systemctl", "daemon-reload"])
+    except Exception:
+        for path, data in saved.items():
+            if data is not None:
+                atomic_write(path, data, 0o755 if path == vless_binary() else 0o644 if path == unit else 0o640,
+                             group_id() if path.name == "vless.json" else None)
+        atomic_write(STATE, json_text(state))
+        if state.get("traffic", {}).get("enabled"):
+            apply_traffic(state)
+        retained = firewall_records()
+        missing = [r for r in selected if r not in retained]
+        for record in missing:
+            run(firewall_command(record, "add"), stdout=subprocess.DEVNULL)
+        save_firewall(retained + missing)
+        run(["systemctl", "daemon-reload"])
+        if enabled:
+            run(["systemctl", "enable", VLESS_SERVICE])
+        if active:
+            run(["systemctl", "start", VLESS_SERVICE])
+        export_files(state, show=False)
+        if state.get("publication"):
+            publish_files(state)
+        raise
+    print("VLESS 已移除，HY2 仍保留。")
+
+
+def vless_control(action):
+    if not load_state().get("vless"):
+        raise ValueError("尚未安装 VLESS。")
+    if action not in ("start", "stop", "restart", "enable", "disable", "status"):
+        raise ValueError("无效的 VLESS 服务操作。")
+    run(["systemctl", action, VLESS_SERVICE] + (["--no-pager"] if action == "status" else []))
 
 
 def subscription_config_path():
@@ -328,8 +679,28 @@ def client_files(state):
                "outbounds": [outbound, {"type": "direct", "tag": "direct"}],
                "route": {"rules": [{"ip_is_private": True, "action": "route", "outbound": "direct"}],
                          "final": "proxy", "default_domain_resolver": "local"}}
-    subscription = base64.b64encode((uri + "\n").encode()).decode() + "\n"
-    return {"node.txt": uri + "\n", "hiddify.txt": subscription, "v2rayn.txt": subscription,
+    all_uris = uri + "\n"
+    extra_files = {"hy2.txt": uri + "\n"}
+    if state.get("vless"):
+        v = state["vless"]
+        extra_files["vless.txt"] = vless_uri(v) + "\n"
+        all_uris += extra_files["vless.txt"]
+        label = v["name"] if v["name"] not in (state["name"], "DIRECT", "节点选择") else v["name"] + " · REALITY"
+        clash["proxies"].append({"name": label, "type": "vless", "server": v["server"], "port": v["port"],
+            "uuid": v["uuid"], "network": "tcp", "tls": True, "udp": True, "flow": "xtls-rprx-vision",
+            "servername": v["sni"], "client-fingerprint": "chrome",
+            "reality-opts": {"public-key": v["public_key"], "short-id": v["short_id"]}})
+        clash["proxy-groups"][0]["proxies"].insert(1, label)
+        outbound["tag"] = "hy2"
+        singbox["outbounds"] = [
+            {"type": "selector", "tag": "proxy", "outbounds": ["hy2", "vless"], "default": "hy2"}, outbound,
+            {"type": "vless", "tag": "vless", "server": v["server"], "server_port": v["port"], "uuid": v["uuid"],
+             "flow": "xtls-rprx-vision", "tls": {"enabled": True, "server_name": v["sni"],
+             "utls": {"enabled": True, "fingerprint": "chrome"},
+             "reality": {"enabled": True, "public_key": v["public_key"], "short_id": v["short_id"]}}},
+            {"type": "direct", "tag": "direct"}]
+    subscription = base64.b64encode(all_uris.encode()).decode() + "\n"
+    return {**extra_files, "node.txt": all_uris, "hiddify.txt": subscription, "v2rayn.txt": subscription,
             "clash.yaml": json_text(clash), "flclash.yaml": json_text(clash),
             "sing-box.json": json_text(singbox), "native.json": json_text(native)}
 
@@ -345,6 +716,8 @@ def export_files(state, show=True):
     os.chmod(target, 0o700)
     for name, content in client_files(state).items():
         atomic_write(target / name, content)
+    if not state.get("vless"):
+        (target / "vless.txt").unlink(missing_ok=True)
     if show:
         print("\nHiddify / 支持 HY2 的客户端可从剪贴板导入：\n" + client_files(state)["node.txt"])
         for name, label in SUBSCRIPTIONS.items():
@@ -577,6 +950,8 @@ def restore_config(target):
     os.chown(ETC / "server.json", 0, gid)
     if subscription_config_path().exists():
         os.chown(subscription_config_path(), 0, gid)
+    if (ETC / "vless.json").exists():
+        os.chown(ETC / "vless.json", 0, gid)
     for path in (ETC / "tls", *(ETC / "tls").rglob("*")):
         if not path.is_symlink():
             os.chown(path, 0, gid)
@@ -773,6 +1148,8 @@ def subscription_url(publication, filename, local=False):
 
 
 def check_subscription_port(value):
+    if STATE.exists() and load_state().get("vless", {}).get("port") == port_number(value):
+        raise ValueError("该 TCP 端口已用于 VLESS。")
     port = port_number(value)
     if output(["ss", "-H", "-ltn", f"sport = :{port}"]):
         raise ValueError(f"TCP {port} 已被占用，请换一个订阅端口。")
@@ -989,7 +1366,7 @@ def unpublish():
         if unit.exists():
             run(["systemctl", "disable", "--now", SUB_SERVICE])
         subscription_config_path().unlink(missing_ok=True)
-        firewall_prune(protocol="tcp")
+        firewall_prune(only=[r for r in firewall_records() if r["port"] == p["port"]], protocol="tcp")
         del state["publication"]
         atomic_write(STATE, json_text(state))
         print("已关闭 IP 订阅服务并撤销链接；已经导入的节点仍可连接。")
@@ -1063,11 +1440,15 @@ def traffic_rules(state, exists):
             rules.append(f"flush chain {table} {chain}")
     for direction, chain, field, address_field in (("upload", "incoming", "dport", "saddr"),
                                                    ("download", "outgoing", "sport", "daddr")):
-        rules.append(f"add rule {table} {chain} udp {field} {port} jump {direction}_limits")
-        for version in (4, 6):
-            protocol = "ip" if version == 4 else "ip6"
-            counter = ("up" if direction == "upload" else "down") + str(version)
-            rules.append(f"add rule {table} {chain} udp {field} {port} update @{counter} {{ {protocol} {address_field} counter }}")
+        transports = [("udp", port)]
+        if state.get("vless"):
+            transports.append(("tcp", port_number(state["vless"]["port"])))
+        for transport, listen_port in transports:
+            rules.append(f"add rule {table} {chain} {transport} {field} {listen_port} jump {direction}_limits")
+            for version in (4, 6):
+                protocol = "ip" if version == 4 else "ip6"
+                counter = ("up" if direction == "upload" else "down") + str(version)
+                rules.append(f"add rule {table} {chain} {transport} {field} {listen_port} update @{counter} {{ {protocol} {address_field} counter }}")
         for address, limit in sorted(state.get("traffic", {}).get("limits", {}).items()):
             address = ip_literal(address)
             rate = Decimal(rate_mbps(limit.get(direction, "0")))
@@ -1139,7 +1520,7 @@ def traffic_snapshot(table):
 
 
 def monitor(once=False, interval=2):
-    print("只统计 HY2 UDP 端口放行的流量（含协议开销），方向以客户端为准。")
+    print("统计 HY2 UDP 与已安装 VLESS TCP 端口合计流量（含协议开销），方向以客户端为准。")
     print("累计值自启用/计数重建起；IP 单方向空闲 24 小时后清零。Ctrl+C 退出显示，监控与限速继续。")
     previous = traffic_snapshot(nft_table())
     last = time.monotonic()
@@ -1153,7 +1534,7 @@ def monitor(once=False, interval=2):
         limits = load_state().get("traffic", {}).get("limits", {})
         if sys.stdout.isatty() and not once:
             print("\033[2J\033[H", end="")
-        print(f"\nHY2 客户端 IP 流量 {dt.datetime.now():%H:%M:%S}（↑客户端上传 ↓客户端下载；1 MB/s = 8 Mbps）")
+        print(f"\nHY 客户端 IP 合计流量 {dt.datetime.now():%H:%M:%S}（↑客户端上传 ↓客户端下载；1 MB/s = 8 Mbps）")
         print(f"{'客户端 IP':<40} {'↑ Mbps':>10} {'↓ Mbps':>10} {'↑ MB/s':>10} {'↓ MB/s':>10} {'↑ MiB':>10} {'↓ MiB':>10}  限速↑/↓ Mbps")
         for address, values in sorted(current.items(), key=lambda item: sum(item[1].values()), reverse=True):
             before = previous.get(address, {"upload": 0, "download": 0})
@@ -1332,10 +1713,14 @@ def firewall_setup():
     state["firewall_mode"] = "auto" if mode == "1" else "manual"
     firewall_apply(state)
     firewall_prune(state["port"] if mode == "1" else None)
+    tcp_ports = set()
     if state.get("publication", {}).get("mode") == "http":
-        port = state["publication"]["port"]
+        tcp_ports.add(state["publication"]["port"])
+    if state.get("vless"):
+        tcp_ports.add(state["vless"]["port"])
+    for port in tcp_ports:
         firewall_apply({**state, "port": port}, protocol="tcp")
-        firewall_prune(port if mode == "1" else None, protocol="tcp")
+    firewall_prune(only=[r for r in firewall_records() if mode != "1" or r["port"] not in tcp_ports], protocol="tcp")
     atomic_write(STATE, json_text(state))
     firewall_hint(state)
 
@@ -1343,6 +1728,8 @@ def firewall_setup():
 def firewall_hint(state):
     print(f"\n请在云安全组和宝塔防火墙放行 UDP {state['port']}。")
     print(f"若正在使用 UFW，可执行：ufw allow {state['port']}/udp")
+    if state.get("vless"):
+        print(f"VLESS/REALITY 另需放行 TCP {state['vless']['port']}。")
     if state.get("publication", {}).get("mode") == "http":
         print(f"IP 订阅另需放行 TCP {state['publication']['port']}。")
     else:
@@ -1357,7 +1744,7 @@ def start():
 
 
 def status():
-    print(f"\nHY {VERSION} — Hysteria2 中文管理")
+    print(f"\nHY {VERSION} — HY2 / VLESS 中文管理")
     if not STATE.exists():
         print("尚未安装；选择快速安装即可开始。")
         return
@@ -1368,6 +1755,9 @@ def status():
     print(f"服务：{active} | 开机启动：{'开启' if enabled else '关闭'} | 内核：{state.get('core_version', '未知')}")
     mode = "纯 IP / 自签证书" if state.get("cert_mode") == "selfsigned" else "域名 / 已有证书"
     print(f"模式：{mode} | 连接：{state['server']} UDP {state['port']}")
+    if state.get("vless"):
+        v = state["vless"]
+        print(f"VLESS/REALITY：{'运行中' if vless_active() else '已停止'} | {v['server']} TCP {v['port']} | sing-box {v.get('core_version', '')}")
     if state.get("publication", {}).get("mode") == "http":
         active = subprocess.run(["systemctl", "is-active", "--quiet", SUB_SERVICE],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
@@ -1403,6 +1793,9 @@ def doctor():
               ("证书同步定时器运行", lambda: output(["systemctl", "is-active", "hy-cert-sync.timer"])),
               ("DNS / 连接地址", lambda: ", ".join(sorted({x[4][0] for x in socket.getaddrinfo(state["server"], state["port"])}))),
               ("本机防火墙", firewall)]
+    if state.get("vless"):
+        checks.extend([("VLESS 服务", vless_active),
+                       (f"TCP {state['vless']['port']} 监听", lambda: bool(output(["ss", "-H", "-lnt", f"sport = :{state['vless']['port']}"])))])
     print(f"管理器 {VERSION} / 内核 {state.get('core_version', '未知')}")
     for label, check in checks:
         try:
@@ -1412,7 +1805,7 @@ def doctor():
         except Exception as exc:
             print(f"[FAIL] {label}：{exc}")
     firewall_hint(state)
-    print("本机诊断不能证明公网 UDP、客户端握手或实际速度；请用导出的配置连接验证。")
+    print("本机诊断不能证明公网 TCP/UDP、客户端握手或实际速度；请用导出的配置连接验证。")
 
 
 def web_module(download=False):
@@ -1454,6 +1847,9 @@ def uninstall():
         print("已取消。")
         return
     saved = backup()
+    vless_unit_path = UNIT_DIR / VLESS_SERVICE
+    if vless_unit_path.exists() and MARKER not in vless_unit_path.read_text():
+        raise ValueError("同名 sing-box 服务归属不明，停止卸载。")
     if firewall_prune(protocol=None):
         raise ValueError("自建防火墙规则尚未清理完，已保留安装。请修复防火墙后重新运行 hy uninstall。")
     if Path("/etc/hy-web/config.json").exists():
@@ -1465,8 +1861,10 @@ def uninstall():
     if subscription_unit.exists() and MARKER in subscription_unit.read_text():
         run(["systemctl", "disable", "--now", SUB_SERVICE])
     run(["systemctl", "disable", "--now", "hy-cert-sync.timer", SERVICE])
+    if vless_unit_path.exists():
+        run(["systemctl", "disable", "--now", VLESS_SERVICE])
     subprocess.run(["systemctl", "stop", "hy-cert-sync.service"], check=False)
-    for name in units():
+    for name in (*units(), VLESS_SERVICE):
         path = UNIT_DIR / name
         if path.exists() and MARKER in path.read_text():
             path.unlink()
@@ -1481,8 +1879,8 @@ def uninstall():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HY：中文 Hysteria2 单节点管理工具")
-    parser.add_argument("command", nargs="?", default="menu", choices=["menu", "install", "configure", "update", "self-update", "status", "firewall", "enable", "disable", "export", "publish", "unpublish", "sync-cert", "doctor", "logs", "start", "stop", "restart", "backup", "uninstall", "monitor", "limit", "unlimit", "limits", "monitor-off", "traffic-apply", "serve-subscription", "web-install", "web-status", "web-password", "web-uninstall"])
+    parser = argparse.ArgumentParser(description="HY：中文 HY2 / VLESS 管理工具")
+    parser.add_argument("command", nargs="?", default="menu", choices=["menu", "install", "configure", "update", "self-update", "status", "firewall", "enable", "disable", "export", "publish", "unpublish", "sync-cert", "doctor", "logs", "start", "stop", "restart", "backup", "uninstall", "monitor", "limit", "unlimit", "limits", "monitor-off", "traffic-apply", "serve-subscription", "web-install", "web-status", "web-password", "web-uninstall", "vless-install", "vless-configure", "vless-update", "vless-remove", "vless-start", "vless-stop", "vless-restart", "vless-enable", "vless-disable", "vless-status", "vless-logs"])
     parser.add_argument("ip", nargs="?", help="需要限速的客户端公网 IP")
     parser.add_argument("--upload", type=rate_mbps, help="客户端上传上限 Mbps，0 不限")
     parser.add_argument("--download", type=rate_mbps, help="客户端下载上限 Mbps，0 不限")
@@ -1490,7 +1888,14 @@ def main():
     parser.add_argument("--web-root", help="可选面板部署到此网站根目录的 hy/ 子目录")
     parser.add_argument("--web-origin", help="面板已有 HTTPS 网站源地址")
     parser.add_argument("--web-port", type=port_number, help="面板本机监听端口，默认 31244")
+    parser.add_argument("--vless-port", type=port_number, help="VLESS TCP 端口，默认从 24445 起查找")
+    parser.add_argument("--vless-server", help="VLESS 客户端连接地址")
+    parser.add_argument("--reality-target", help="REALITY 公网目标域名:443")
+    parser.add_argument("--reality-sni", help="REALITY 目标证书域名")
+    parser.add_argument("--yes", action="store_true", help="显式确认 VLESS 安装/修改，无交互模式")
     args = parser.parse_args()
+    if (args.yes or any(v is not None for v in (args.vless_port, args.vless_server, args.reality_target, args.reality_sni))) and args.command not in ("vless-install", "vless-configure"):
+        parser.error("VLESS 参数和 --yes 仅用于 vless-install/vless-configure。")
     if any(v is not None for v in (args.web_root, args.web_origin, args.web_port)) and args.command != "web-install":
         parser.error("--web-* 参数仅用于 web-install。")
     if (args.ip and args.command not in ("limit", "unlimit")) or (args.once and args.command != "monitor") or \
@@ -1515,7 +1920,13 @@ def main():
                "web-install": lambda: web_install(args.web_root, args.web_origin, args.web_port),
                "web-password": lambda: web_module().reset_password(),
                "web-uninstall": lambda: web_module().uninstall(),
-               "web-status": lambda: run(["systemctl", "status", "hy-web.service", "--no-pager"])}
+               "web-status": lambda: run(["systemctl", "status", "hy-web.service", "--no-pager"]),
+               "vless-install": lambda: vless_install(args.vless_port, args.reality_target, args.reality_sni, args.vless_server, args.yes),
+               "vless-configure": lambda: vless_install(args.vless_port, args.reality_target, args.reality_sni, args.vless_server, args.yes, True),
+               "vless-update": vless_update, "vless-remove": vless_remove,
+               "vless-logs": lambda: run(["journalctl", "-u", VLESS_SERVICE, "-n", "50", "--no-pager"])}
+    for action in ("start", "stop", "restart", "enable", "disable", "status"):
+        actions["vless-" + action] = lambda action=action: vless_control(action)
     def dispatch(command):
         if command == "monitor":
             ensure_monitor()
@@ -1532,10 +1943,11 @@ def main():
     groups = [
         ("安装与配置", [("快速 / 高级安装（已安装时刷新管理器）", "install"), ("修改节点配置", "configure"), ("设置端口放行", "firewall")]),
         ("连接与订阅", [("按客户端导入", "export-client"), ("查看全部导出", "export"), ("发布 / 刷新 IP 或 HTTPS 订阅", "publish"), ("撤销订阅", "unpublish")]),
-        ("服务管理", [("启动并开启开机启动", "start"), ("停止（不改变开机启动）", "stop"), ("重启", "restart"), ("开启开机启动", "enable"), ("关闭开机启动（不停止服务）", "disable")]),
+        ("HY2 服务管理", [("启动并开启开机启动", "start"), ("停止（不改变开机启动）", "stop"), ("重启", "restart"), ("开启开机启动", "enable"), ("关闭开机启动（不停止服务）", "disable")]),
         ("监控与限速", [("客户端 IP 实时流量", "monitor"), ("设置 IP 上下行限速", "limit"), ("取消 IP 限速", "unlimit"), ("查看限速配置", "limits"), ("关闭监控和限速", "monitor-off")]),
-        ("更新与维护", [("更新管理脚本", "self-update"), ("更新官方内核", "update"), ("诊断", "doctor"), ("查看日志", "logs"), ("备份配置", "backup"), ("卸载", "uninstall")]),
-        ("可视化面板（默认不安装）", [("安装 / 更新面板", "web-install"), ("查看面板状态", "web-status"), ("修改面板密码", "web-password"), ("只卸载面板", "web-uninstall")])]
+        ("更新与维护", [("更新管理脚本", "self-update"), ("更新 HY2 官方内核", "update"), ("诊断", "doctor"), ("查看日志", "logs"), ("备份配置", "backup"), ("卸载", "uninstall")]),
+        ("可视化面板（默认不安装）", [("安装 / 更新面板", "web-install"), ("查看面板状态", "web-status"), ("修改面板密码", "web-password"), ("只卸载面板", "web-uninstall")]),
+        ("VLESS / REALITY（可选 TCP 备用）", [("安装 VLESS", "vless-install"), ("修改 VLESS 配置", "vless-configure"), ("启动", "vless-start"), ("停止", "vless-stop"), ("重启", "vless-restart"), ("查看状态", "vless-status"), ("更新 sing-box 内核", "vless-update"), ("只移除 VLESS", "vless-remove")])]
     while True:
         status()
         for i, (label, _) in enumerate(groups, 1):

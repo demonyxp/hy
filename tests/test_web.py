@@ -97,6 +97,18 @@ class WebTests(unittest.TestCase):
             self.assertEqual(body['content'], 'hysteria2://test')
             self.assertEqual(headers['Cache-Control'], 'no-store')
 
+    def test_protocol_controls_are_isolated(self):
+        cookie, csrf = self.login()
+        with patch.object(hy, 'load_state', return_value={'vless': {'port': 24445}}), \
+             patch.object(web, 'command') as command:
+            self.assertEqual(self.request('/api/action', {'action': 'stop', 'protocol': 'vless'}, cookie, csrf)[0], 200)
+            command.assert_called_once_with(['systemctl', 'stop', 'hy-vless.service'], timeout=45)
+        with patch.object(hy, 'load_state', return_value={}), patch.object(web, 'command') as command:
+            self.assertEqual(self.request('/api/action', {'action': 'stop', 'protocol': 'vless'}, cookie, csrf)[0], 400)
+            self.assertEqual(self.request('/api/action', {'action': 'stop', 'protocol': 'nginx'}, cookie, csrf)[0], 400)
+            self.assertEqual(self.request('/api/export?format=vless.txt', cookie=cookie)[0], 400)
+            command.assert_not_called()
+
     def test_monitor_rates_do_not_invent_startup_spikes(self):
         monitor = web.Monitor()
         counts = {'203.0.113.1': {'upload': 1000000000, 'download': 2000000000}}

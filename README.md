@@ -1,4 +1,4 @@
-# HY — Hysteria2 中文一键部署
+# HY — HY2 / VLESS 中文一键部署
 
 面向单服务器的中文部署工具：支持已有域名证书，也支持无域名、无现成证书的纯 IP 安装。安装官方 Hysteria2 内核，生成节点和客户端配置，用 `hy` 管理。
 
@@ -16,7 +16,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/demonyxp/hy/main/install.sh)
 
 公网 IP 识别通过 HTTPS 查询 ipify / ifconfig.co，IPv4 优先，失败尝试 IPv6；总查询时间最多约 20 秒。失败后手动输入。默认端口为 `24443`，冲突时检查至 `24453`，均占用则手动指定。自动识别结果是公网出口地址；NAT、多 IP 服务器应核对地址和 UDP 转发。
 
-需要固定版本时，把命令中的 `main` 换成 `v0.6.0`。首次安装和交互菜单需要终端；SSH 远程执行请使用 `ssh -t`。不会把管道输入或无人值守环境当作确认。
+需要固定版本时，把命令中的 `main` 换成 `v0.7.0`。首次安装和交互菜单需要终端；SSH 远程执行请使用 `ssh -t`。不会把管道输入或无人值守环境当作确认。
 
 ## 可选可视化面板（v0.6.0）
 
@@ -46,12 +46,12 @@ include /etc/hy-web/nginx.conf;
 
 面板提供：
 
-- 节点、服务、系统资源状态；最近三分钟 HY2 流量曲线。
+- 节点、服务、系统资源状态；最近三分钟已安装协议的合计流量曲线。
 - 客户端公网 IP 流量、累计值、上下行限速；复用已有 nftables 实现。未开启统计时明确显示，并提供「启用流量监控」。浏览页面本身不会重建规则。
 - 启动、停止、重启以及独立的开机启动开关。停止/重启会中断 VPN；如果通过该 VPN 访问面板，操作后也可能暂时无法访问页面。
 - HY2 链接、Hiddify、v2rayN、Clash/Mihomo、FlClash、sing-box 导出；已有订阅地址可复制。导出包含节点凭据，请勿公开。
 
-「最近有流量」只代表采样期间看到数据包，不能证明客户端已认证在线。统计包含 HY2 UDP 协议开销，不包含网站、SSH 和其他服务；相同公网 IP 共用限速。累计计数重建会清零，单方向空闲 24 小时会过期。页面每三秒采样，仅显示流量最高的前 200 个 IP。限速是令牌桶丢包机制，实际速度可能低于设置值。
+「最近有流量」只代表采样期间看到数据包，不能证明客户端已认证在线。统计包含 HY2 UDP 与已安装 VLESS TCP 的协议开销，不包含网站、SSH 和其他服务；相同公网 IP 的所有已安装协议共用限速。累计计数重建会清零，单方向空闲 24 小时会过期。页面每三秒采样，仅显示流量最高的前 200 个 IP。限速是令牌桶丢包机制，实际速度可能低于设置值。
 
 ```bash
 hy web-status       # 查看面板服务
@@ -61,6 +61,53 @@ hy web-uninstall    # 只卸载面板，保留 VPN
 ```
 
 `hy self-update` 仍只更新管理器；已安装面板时，随后再执行 `hy web-install` 更新面板文件。面板安装失败会恢复原配置、页面和服务状态。卸载仅移除本工具的页面与凭据，用户额外放进 hy/ 的文件保留；Nginx include 片段保留为空文件，避免网站重载失败，可以手动移除该 include。整体 `hy uninstall` 会先清理面板。
+
+## 可选 TCP 备用：VLESS / REALITY（v0.7.0）
+
+默认仍只部署 HY2。已有用户先升级管理器，再选装：
+
+```bash
+hy self-update
+hy vless-install
+# 已安装可视化面板时，同时更新面板
+hy web-install
+```
+
+向导默认从 TCP 24445～24454 中选择空闲端口，生成 UUID、X25519 密钥和 Short ID，检查目标站点 TLS 1.3、HTTP/2 和证书，再一次确认安装。下载并校验固定的 SagerNet/sing-box 官方稳定版本 `v1.14.4`；新服务为 `hy-vless.service`，配置为 `/etc/hy/vless.json`，以 `hyproxy` 用户运行。HY2 进程、密码和证书保持不变。不会抢占 Nginx 的 443 端口或停止其他程序。
+
+`hy vless-update` 使用管理器固定并通过客户端实测的 sing-box 稳定版本，校验官方 SHA-256 后更新，失败保留旧核心。VLESS 使用独立的 `sing-box-vless` 二进制，不接管已有 sing-box 服务。
+
+REALITY 不要求你购买域名或申请证书；客户端可连接服务器 IP。目标与 SNI 必须指向可用的公网 TLS 站点，它们不同于客户端连接地址。默认检查 `www.microsoft.com:443`，目标不可用时可另选。完整自定义示例：
+
+```bash
+hy vless-install --vless-server 203.0.113.10 --vless-port 24445 \
+  --reality-target www.microsoft.com:443 --reality-sni www.microsoft.com
+```
+
+没有终端的自动化调用需要显式增加 `--yes`，不会默认同意。TCP 与 UDP 相同端口号可以共存，例如没有其他 TCP 服务时也可指定 TCP 24443；IP 订阅的 TCP 端口不能与 VLESS 共用。安装器沿用原有自动/手动防火墙模式，**云安全组仍需放行实际选择的 TCP 端口**。服务运行或端口监听成功不能证明外网可连接。
+
+安装完成后刷新原订阅地址即可获得两个节点；原 HY2 URI、凭据和订阅 token 保留。Hiddify/v2rayN Base64 订阅包含两条 URI；Mihomo/FlClash 配置包含两个可切换节点；sing-box 配置使用 selector，默认仍选择 HY2。`hy export` 同时导出 `hy2.txt` 与 `vless.txt` 单协议链接；`native.json` 仍仅供官方 Hysteria 客户端使用。
+
+面板「服务管理」可选择 HY2 或 VLESS，分别启停和设置开机启动。新增协议必须在 SSH 中安装，面板不提供任意安装脚本执行入口。
+
+```bash
+hy vless-status
+hy vless-start
+hy vless-stop          # 只停止 VLESS，HY2 不受影响
+hy vless-restart
+hy vless-enable
+hy vless-disable
+hy vless-configure     # 修改端口、连接地址、目标；保留 UUID 和密钥
+hy vless-update        # 更新到管理器验证的 sing-box 兼容版，失败回滚
+hy vless-logs
+hy vless-remove        # 只移除 VLESS，并刷新原订阅
+```
+
+已有 `hy start/stop/restart/update` 仍针对 HY2；整体 `hy uninstall` 会停用并清理两个协议。修改/更新 VLESS 保留原服务运行和开机启动状态，首次安装则启动并开启开机启动。
+
+**监控与限速口径：** 启用 VLESS 后，HY2 UDP 与 VLESS TCP 的端口流量按公网 IP 合并，已有上下行限速对合计流量生效；不会清空原 nft 计数集合。包含重传、协议开销及到监听端口的未认证请求，不等于实际用户在线或净业务流量；REALITY 未认证请求可能转发至目标站点。移除 VLESS 后仅继续统计 HY2，历史累计值仍保留至计数过期或重建。网页会显示当前统计范围。
+
+参考：[sing-box REALITY](https://sing-box.sagernet.org/configuration/shared/tls/)、[Mihomo VLESS](https://wiki.metacubex.one/config/proxies/vless/)、[sing-box VLESS](https://sing-box.sagernet.org/configuration/outbound/vless/)。
 
 Amazon Linux 2023 的 `ec2-user` 用户先单独执行 `sudo -i`，看到 root 提示符后再运行安装命令。安装器自动使用 DNF 补齐依赖，不升级整个系统；沿用系统 Python 3.9 和已经可用的 curl/curl-minimal。域名证书使用 OpenSSL 的系统默认 CA 信任库验证。与 sing-box 共存时使用不同的监听端口，安装器不会停止或覆盖 sing-box；在 AWS 安全组另行放行选定的 UDP 端口。
 
@@ -154,7 +201,7 @@ hy export
 
 域名模式开启公共 CA 证书验证；纯 IP 模式按上面的方式携带证书身份。不需要 REALITY 的指纹、Short ID、Vision 或 ML-KEM 配置。没有预设虚高带宽值，使用 Hysteria2 默认拥塞控制；网速取决于线路和 UDP 通信质量。
 
-**这些是同一个 HY2 节点的不同客户端格式。** Clash 需使用支持 Hysteria2 的 Mihomo 内核，旧版原版 Clash 不支持。Hiddify、v2rayN 请使用带 HY2 支持的新版。VLESS 是另一种协议，不是客户端名称；本工具不部署 VLESS，也不会生成无效的 `vless://` 链接。
+**这些是同一组已安装节点的不同客户端格式。** Clash 需使用支持 Hysteria2 的 Mihomo 内核，旧版原版 Clash 不支持。Hiddify、v2rayN 请使用带 HY2 支持的新版。VLESS 是另一种协议，不是客户端名称；v0.7.0 起可通过 `hy vless-install` 选装 VLESS/REALITY，安装后订阅同时包含 HY2 和 VLESS 节点。
 
 sing-box 配置使用系统 DNS，局域网直连、其余代理，不依赖外部规则数据库；它提供本地代理端口，不自动启用 TUN。Hiddify 优先使用 `hiddify.txt` 订阅，让应用管理 TUN 和分流。
 
@@ -270,7 +317,7 @@ hy monitor-off
 也可以在中文菜单选择“客户端 IP 实时流量”或“设置 IP 上下行限速”。不带参数的 `hy limit` 会交互询问 IP 和上下行上限。
 
 - **方向以客户端为准**：上传是客户端 → 服务器，下载是服务器 → 客户端。单位 Mbps 是兆比特/秒，8 Mbps 约等于 1 MB/s。
-- 监控统计通过专用规则的 IP 层字节，包含加密及协议开销，不包含本限速规则丢弃的包。它反映访问 HY2 UDP 端口的 IP，不能单独证明该 IP 已通过密码认证；不是全服务器网卡统计。
+- 监控统计通过专用规则的 IP 层字节，包含加密及协议开销，不包含本限速规则丢弃的包。它反映访问 HY2 UDP 与已安装 VLESS TCP 端口的 IP，不能单独证明该 IP 已通过密码认证；不是全服务器网卡统计。
 - 同一公网 IP 下的设备共用一个统计项和限速额度；IP 变化后需要重新设置对应规则。只支持单个 IP，不接受网段或域名。
 - 通过 nftables 令牌桶丢弃超额包，允许短时突发，不是平滑排队整形。HY2 会受到丢包和拥塞控制影响，实际下载速度可能低于所设上限；入站包已经抵达服务器，所以不能靠这个功能减少云厂商收到的入站流量计费。
 - 配置保存在 `/etc/hy/state.json`，由 `hy-traffic.service` 开机恢复。修改 HY2 端口时同步调整规则，失败时回滚。这里只操作带归属标记的 `inet hy_traffic` 表，不清空已有防火墙，不自动放行端口，不改 SSH/Nginx 或全局网卡队列。
@@ -301,7 +348,7 @@ journalctl -u hy-cert-sync.service -n 30 --no-pager
 
 ## 项目范围与测试
 
-这是单节点部署工具，不提供网页面板、多用户计费、流量套餐、自动申请域名证书、自动卸载其他 VPN 或自动接管宝塔。端口自动放行仅针对上文列出的防火墙；客户端 IP 监控/限速仅在主动启用时写入自己的 nftables 表。
+这是单服务器部署工具，提供可选网页管理面板，不提供多用户计费、流量套餐、自动申请域名证书、自动卸载其他 VPN 或自动接管宝塔。端口自动放行仅针对上文列出的防火墙；客户端 IP 监控/限速仅在主动启用时写入自己的 nftables 表。
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -348,3 +395,6 @@ v0.4.1 增加 Amazon Linux 2023 支持：适配 DNF 包名、系统默认 CA 信
 v0.5.0 移除管理锁，并增加 IP HTTP 订阅。在 Ubuntu 24.04 与 Amazon Linux 2023 隔离环境通过 40 项单元测试及实际 systemd 订阅服务测试：覆盖旧版暂停进程持锁时的升级/管理操作、五种订阅格式、IPv6 HTTP、错误令牌和目录访问拒绝、动态刷新、失败回滚、撤销及卸载。UFW/firewalld 实测验证 TCP 订阅规则清理不会影响 UDP 节点规则。未逐一验证各图形客户端的 HTTP URL 导入界面。
 
 参考：[Hysteria2 官方](https://github.com/HyNetworks/hysteria)、[服务端配置](https://v2.hysteria.network/zh/docs/advanced/Full-Server-Config/)、[节点 URI](https://v2.hysteria.network/docs/developers/URI-Scheme/)、[Mihomo Hysteria2 配置](https://wiki.metacubex.one/config/proxies/hysteria2/)、[sing-box Hysteria2 配置](https://sing-box.sagernet.org/configuration/outbound/hysteria2/)。
+
+
+v0.7.0 增加可选 VLESS/REALITY。`tests/live_vless.py` 在 Ubuntu 24.04 和 Amazon Linux 2023 中验证实际 REALITY 握手、Mihomo/sing-box 代理请求、错误 UUID 拒绝、IPv4/IPv6、合并计数、失败内核回滚、独立启停和订阅地址保持不变。运行前需完成 `live_systemd.py`，并将官方 Linux sing-box v1.14.4、Mihomo v1.19.33 二进制分别放入 `/opt/test-clients/sing-box`、`/opt/test-clients/mihomo`；前者同时作为测试服务端。`tests/live_web.py` 验证面板双协议服务操作隔离。均仅允许在一次性测试容器运行。

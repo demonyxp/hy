@@ -22,7 +22,7 @@ import hy
 CONFIG = Path('/etc/hy-web/config.json')
 SERVICE = 'hy-web.service'
 PREFIX = '/hy/'
-FILES = {'node.txt', 'hiddify.txt', 'v2rayn.txt', 'clash.yaml', 'flclash.yaml', 'sing-box.json'}
+FILES = {'node.txt', 'hy2.txt', 'vless.txt', 'hiddify.txt', 'v2rayn.txt', 'clash.yaml', 'flclash.yaml', 'sing-box.json'}
 
 
 class OperationError(RuntimeError):
@@ -105,6 +105,7 @@ def install(root=None, origin=None, port=None):
         raise ValueError('已有同名服务不属于本工具。')
     if not old:
         with socket.socket() as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(('127.0.0.1', config['port']))
     manifest = json.loads(hy.fetch_manager(f'{hy.MANAGER_URL}/v{hy.VERSION}/release.json'))
     html = hy.fetch_manager(f'{hy.MANAGER_URL}/v{hy.VERSION}/web/index.html')
@@ -248,7 +249,12 @@ def status_data():
     total = int(mem['MemTotal'].split()[0])
     available = int(mem['MemAvailable'].split()[0])
     disk = shutil.disk_usage('/')
-    return dict(version=hy.VERSION, core=state.get('core_version', ''), name=state['name'],
+    vless = None
+    if state.get('vless'):
+        vless = {key: state['vless'][key] for key in ('name', 'server', 'port', 'sni', 'core_version')}
+        vless['service'] = command(['systemctl', 'is-active', hy.VLESS_SERVICE], check=False).stdout.strip()
+        vless['autostart'] = command(['systemctl', 'is-enabled', hy.VLESS_SERVICE], check=False).returncode == 0
+    return dict(version=hy.VERSION, core=state.get('core_version', ''), name=state['name'], vless=vless,
                 server=state['server'], port=state['port'], mode=state.get('cert_mode', 'existing'),
                 service=active, autostart=enabled == 'enabled', load=os.getloadavg()[0],
                 memory_percent=round((total - available) / total * 100, 1),
@@ -287,6 +293,7 @@ class Monitor:
                              limits=limits.get(address, {'upload': '0', 'download': '0'})))
         rows.sort(key=lambda r: r['upload_mbps'] + r['download_mbps'], reverse=True)
         data = dict(ready=True, enabled=bool(table and state.get('traffic', {}).get('enabled')),
+                    scope='HY2 + VLESS' if state.get('vless') else 'HY2',
                     clients=rows[:200], count=len(rows),
                     upload_mbps=sum(r['upload_mbps'] for r in rows), download_mbps=sum(r['download_mbps'] for r in rows),
                     upload=sum(r['upload'] for r in rows), download=sum(r['download'] for r in rows),
@@ -429,6 +436,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if name not in FILES:
                     raise ValueError('不支持的导出格式。')
                 state = hy.load_state()
+                if name == 'vless.txt' and not state.get('vless'):
+                    raise ValueError('尚未安装 VLESS。')
                 publication = state.get('publication')
                 self.reply(200, {'filename': name, 'content': hy.client_files(state)[name],
                                  'subscription': hy.subscription_url(publication, name) if publication and name in hy.SUBSCRIPTIONS else None})
@@ -476,7 +485,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def action(self, payload):
         name = payload.get('action')
-        commands = {a: ['systemctl', a, hy.SERVICE] for a in ('start', 'stop', 'restart', 'enable', 'disable')}
+        protocol = payload.get('protocol', 'hy2')
+        if protocol not in ('hy2', 'vless'):
+            raise ValueError('无效协议。')
+        if protocol == 'vless' and not hy.load_state().get('vless'):
+            raise ValueError('尚未安装 VLESS。')
+        service = hy.VLESS_SERVICE if protocol == 'vless' else hy.SERVICE
+        commands = {a: ['systemctl', a, service] for a in ('start', 'stop', 'restart', 'enable', 'disable')}
         commands['monitor-on'] = ['/usr/local/bin/hy', 'monitor', '--once']
         if name == 'limit':
             address = hy.ip_literal(payload.get('ip', ''))

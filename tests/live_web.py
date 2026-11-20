@@ -69,6 +69,23 @@ assert request('status', cookie=cookie)[2]['autostart']
 assert request('action', {'action': 'disable'}, cookie, csrf)[0] == 200
 assert not request('status', cookie=cookie)[2]['autostart']
 assert request('export?format=node.txt', cookie=cookie)[2]['content'].startswith('hysteria2://')
+state = hy.load_state()
+state['vless'] = {'name': 'VLESS fixture', 'server': '203.0.113.10', 'port': 24445,
+                  'sni': 'www.microsoft.com', 'core_version': hy.VLESS_CORE_VERSION,
+                  'uuid': 'b52c9278-e961-4764-8f37-ce41fdf36440', 'public_key': 'b'*43,
+                  'private_key': 'a'*43, 'short_id': '0123456789abcdef'}
+hy.atomic_write(hy.STATE, hy.json_text(state))
+hy.atomic_write(hy.UNIT_DIR / hy.VLESS_SERVICE, '# '+hy.MARKER+'\n[Service]\nExecStart=/bin/sleep infinity\n', 0o644)
+web.command(['systemctl', 'daemon-reload'])
+web.command(['systemctl', 'start', hy.VLESS_SERVICE])
+hy2_pid = web.command(['systemctl', 'show', hy.SERVICE, '-p', 'MainPID', '--value']).stdout
+assert request('action', {'action': 'stop', 'protocol': 'vless'}, cookie, csrf)[0] == 200
+assert request('status', cookie=cookie)[2]['vless']['service'] == 'inactive'
+assert request('action', {'action': 'start', 'protocol': 'vless'}, cookie, csrf)[0] == 200
+assert request('status', cookie=cookie)[2]['vless']['service'] == 'active'
+assert request('export?format=vless.txt', cookie=cookie)[2]['content'].startswith('vless://')
+assert hy2_pid == web.command(['systemctl', 'show', hy.SERVICE, '-p', 'MainPID', '--value']).stdout
+assert 'private_key' not in json.dumps(request('status', cookie=cookie)[2])
 time.sleep(3)
 assert request('traffic', cookie=cookie)[2]['enabled']
 with contextlib.redirect_stdout(io.StringIO()):
